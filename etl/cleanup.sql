@@ -1,0 +1,12 @@
+TRUNCATE titles_next;
+TRUNCATE title_search_next;
+TRUNCATE discover_next;
+TRUNCATE title_filter;
+TRUNCATE stg_title_basics;
+TRUNCATE stg_title_akas;
+TRUNCATE stg_title_ratings;
+TRUNCATE stg_title_principals;
+TRUNCATE stg_title_crew;
+TRUNCATE stg_title_episode;
+TRUNCATE stg_episode_enriched;
+TRUNCATE stg_name_basics;

@@ -1,0 +1,56 @@
+services:
+  db:
+    image: paradedb/paradedb:latest
+    container_name: lumiere_postgres
+    restart: always
+    shm_size: "4gb"
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: mydatabase
+      PGDATA: /var/lib/postgresql/docker
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/docker
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d mydatabase"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    container_name: lumiere_api
+    environment:
+      DATABASE_URL: postgresql://user:password@db:5432/mydatabase
+      IMDB_DATA_DIR: /data
+      ENABLE_PG_SEARCH: true
+      RUN_ETL: "true"
+      ETL_KEEP_STAGING: "true"
+      ETL_LOAD_BATCH_SIZE: "20000"
+      ETL_BATCH_SIZE: "20000"
+      ETL_MAX_PARALLEL_WORKERS: "6"
+      ETL_WORK_MEM: "64MB"
+      ETL_MAINTENANCE_WORK_MEM: "1GB"
+      ETL_DB_MAX_WAL_SIZE: "4GB"
+      ETL_DB_MIN_WAL_SIZE: "1GB"
+      ETL_DB_CHECKPOINT_TIMEOUT: "30min"
+      ETL_DB_CHECKPOINT_COMPLETION_TARGET: "0.9"
+      ETL_DB_WAL_COMPRESSION: "on"
+      ETL_DB_MAX_PARALLEL_WORKERS: "8"
+      ETL_DB_MAX_PARALLEL_MAINTENANCE_WORKERS: "4"
+      ETL_MIN_NUMVOTES: "5"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - imdbdata:/data
+
+volumes:
+  pgdata:
+  imdbdata:

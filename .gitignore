@@ -1,0 +1,34 @@
+# Go build/test artifacts
+/bin/
+/pkg/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+cover.out
+
+# Logs
+*.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Env files
+.env
+.env.*
+
+# Local data volumes
+/imdb-data/
+/pgdata/

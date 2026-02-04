@@ -1,0 +1,7 @@
+.git
+**/*.tsv
+**/*.tsv.gz
+**/__pycache__
+**/*.pyc
+api/app
+api/requirements.txt
