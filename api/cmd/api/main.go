@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -507,6 +508,45 @@ func clampPositive(val int, def int) int {
 		return def
 	}
 	return val
+}
+
+func clampInt(val int, min int, max int) int {
+	if val < min {
+		return min
+	}
+	if val > max {
+		return max
+	}
+	return val
+}
+
+func computeTitlePopularity(numVotes *int, startYear *int, datasetYear int) int {
+	const (
+		voteWeight      = 0.85
+		recencyWeight   = 0.15
+		voteScale       = 6.0
+		recencyDecayAge = 25.0
+	)
+
+	voteScore := 0.0
+	if numVotes != nil && *numVotes > 0 {
+		voteScore = math.Log10(float64(*numVotes)+1.0) / voteScale
+		if voteScore > 1.0 {
+			voteScore = 1.0
+		}
+	}
+
+	recencyScore := 0.0
+	if startYear != nil && *startYear > 0 {
+		age := datasetYear - *startYear
+		if age < 0 {
+			age = 0
+		}
+		recencyScore = math.Exp(-float64(age) / recencyDecayAge)
+	}
+
+	score := (voteScore * voteWeight) + (recencyScore * recencyWeight)
+	return clampInt(int(math.Round(score*100.0)), 0, 100)
 }
 
 func waitForDB(ctx context.Context, url string, logger *log.Logger) (*pgxpool.Pool, error) {
@@ -1875,6 +1915,7 @@ type searchCopyRow struct {
 	PrimaryTitle  string
 	OriginalTitle string
 	AkaTitles     []string
+	Popularity    int
 }
 
 type titlesNextCopySource struct {
@@ -2026,6 +2067,7 @@ func (s *titlesNextCopySource) Next() bool {
 				PrimaryTitle:  basic.PrimaryTitle,
 				OriginalTitle: basic.OriginalTitle,
 				AkaTitles:     akaTitles,
+				Popularity:    computeTitlePopularity(rating.NumVotes, basic.StartYear, s.datasetDate.Year()),
 			})
 		}
 
@@ -2057,7 +2099,7 @@ type searchRowsCopySource struct {
 func newSearchRowsCopySource(rows []searchCopyRow) *searchRowsCopySource {
 	return &searchRowsCopySource{
 		rows: rows,
-		row:  make([]any, 6),
+		row:  make([]any, 7),
 	}
 }
 
@@ -2074,6 +2116,7 @@ func (s *searchRowsCopySource) Next() bool {
 	s.row[3] = item.PrimaryTitle
 	s.row[4] = item.OriginalTitle
 	s.row[5] = item.AkaTitles
+	s.row[6] = item.Popularity
 
 	s.inserted++
 	return true
@@ -2347,6 +2390,7 @@ func buildAndInsertBatch(ctx context.Context, conn *pgxpool.Conn, cfg Config, tc
 				"primary_title",
 				"original_title",
 				"aka_titles",
+				"popularity",
 			},
 			searchSource,
 		)
@@ -2899,6 +2943,23 @@ type SearchItem struct {
 	Score         float64  `json:"score"`
 }
 
+type SearchResponse struct {
+	Items []SearchItem `json:"items"`
+	Meta  SearchMeta   `json:"meta"`
+}
+
+type SearchMeta struct {
+	Limit          int          `json:"limit"`
+	HasMore        bool         `json:"hasMore"`
+	NextCursor     *string      `json:"nextCursor,omitempty"`
+	AppliedFilters SearchFilter `json:"appliedFilters"`
+}
+
+type SearchFilter struct {
+	Query string `json:"query"`
+	Type  string `json:"type"`
+}
+
 type DiscoverItem struct {
 	Tconst        string   `json:"tconst"`
 	TitleType     string   `json:"titleType"`
@@ -2949,6 +3010,11 @@ type discoverCursor struct {
 	YearKey     *int         `json:"yearKey,omitempty"`
 	RatingKey   *float64     `json:"ratingKey,omitempty"`
 	Fingerprint string       `json:"fingerprint"`
+}
+
+type searchCursor struct {
+	Offset      int    `json:"offset"`
+	Fingerprint string `json:"fingerprint"`
 }
 
 func getTitleHandler(pool *pgxpool.Pool) echo.HandlerFunc {
@@ -3007,38 +3073,97 @@ func searchHandler(pool *pgxpool.Pool, enabled bool) echo.HandlerFunc {
 			limit = 50
 		}
 
-		sql := fmt.Sprintf(`
-SELECT tconst, title_type, start_year, primary_title, original_title, aka_titles,
-       pdb.score(tconst) AS score
+		fingerprint := searchFilterFingerprint(query, titleType)
+		var cursor *searchCursor
+		offset := 0
+		if raw := strings.TrimSpace(c.QueryParam("cursor")); raw != "" {
+			parsed, err := decodeSearchCursor(raw)
+			if err != nil {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
+			}
+			if parsed.Fingerprint != fingerprint {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "cursor does not match requested filters"})
+			}
+			cursor = &parsed
+			offset = cursor.Offset
+		}
+
+		sqlLimit := limit + 1
+		candidateLimit := offset + sqlLimit + 100
+		if candidateLimit < 120 {
+			candidateLimit = 120
+		}
+		if candidateLimit > 2000 {
+			candidateLimit = 2000
+		}
+		args := []any{query, typeList, sqlLimit, candidateLimit, offset}
+
+		sql := `
+WITH primary_original_candidates AS (
+SELECT tconst, title_type, start_year, primary_title, original_title, aka_titles, COALESCE(popularity, 0) AS popularity,
+       pdb.score(tconst) AS score,
+       CASE
+         WHEN lower(primary_title) = lower($1) OR lower(original_title) = lower($1) THEN 0::int
+         ELSE 1::int
+       END AS match_tier
 FROM title_search
 WHERE title_type = ANY($2)
   AND (
-    primary_title @@@ pdb.match($1, distance => 1)
-    OR original_title @@@ pdb.match($1, distance => 1)
-    OR aka_titles @@@ pdb.match($1, distance => 1)
+    primary_title @@@ pdb.match($1, conjunction_mode => true)::pdb.boost(8)
+    OR original_title @@@ pdb.match($1, conjunction_mode => true)::pdb.boost(6)
+    OR primary_title @@@ pdb.match($1, distance => 1, conjunction_mode => true)::pdb.boost(3)
+    OR original_title @@@ pdb.match($1, distance => 1, conjunction_mode => true)::pdb.boost(2)
   )
-ORDER BY score DESC
-LIMIT $3`)
+ORDER BY score DESC, tconst DESC
+LIMIT $4
+), aka_candidates AS (
+SELECT tconst, title_type, start_year, primary_title, original_title, aka_titles, COALESCE(popularity, 0) AS popularity,
+       pdb.score(tconst) AS score,
+       2::int AS match_tier
+FROM title_search
+WHERE title_type = ANY($2)
+  AND (
+    aka_titles @@@ pdb.match($1, conjunction_mode => true)::pdb.boost(0.75)
+    OR aka_titles @@@ pdb.match($1, distance => 1, conjunction_mode => true)::pdb.boost(0.25)
+  )
+ORDER BY score DESC, tconst DESC
+LIMIT $4
+), merged AS (
+SELECT tconst, title_type, start_year, primary_title, original_title, aka_titles, popularity, score, match_tier
+FROM primary_original_candidates
+UNION ALL
+SELECT tconst, title_type, start_year, primary_title, original_title, aka_titles, popularity, score, match_tier
+FROM aka_candidates
+), ranked AS (
+SELECT DISTINCT ON (tconst)
+       tconst, title_type, start_year, primary_title, original_title, aka_titles, popularity, score, match_tier
+FROM merged
+ORDER BY tconst, match_tier ASC, score DESC, popularity DESC
+)
+SELECT tconst, title_type, start_year, primary_title, original_title, aka_titles, score
+FROM ranked
+ORDER BY match_tier ASC, score DESC, popularity DESC, tconst DESC
+LIMIT $3 OFFSET $5`
 
 		ctx := c.Request().Context()
-		rows, err := pool.Query(ctx, sql, query, typeList, limit)
+		rows, err := pool.Query(ctx, sql, args...)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 
-		results := make([]SearchItem, 0, limit)
+		results := make([]SearchItem, 0, sqlLimit)
 		for rows.Next() {
 			var (
 				tconst        string
-				titleType     string
+				resultType    string
 				startYear     pgtype.Int4
 				primaryTitle  string
 				originalTitle string
 				akaTitles     []string
 				score         float64
 			)
-			if err := rows.Scan(&tconst, &titleType, &startYear, &primaryTitle, &originalTitle, &akaTitles, &score); err != nil {
+			if err := rows.Scan(&tconst, &resultType, &startYear, &primaryTitle, &originalTitle, &akaTitles, &score); err != nil {
 				return err
 			}
 			if akaTitles == nil {
@@ -3046,7 +3171,7 @@ LIMIT $3`)
 			}
 			results = append(results, SearchItem{
 				Tconst:        tconst,
-				TitleType:     titleType,
+				TitleType:     resultType,
 				StartYear:     intPtrFromPg(startYear),
 				PrimaryTitle:  primaryTitle,
 				OriginalTitle: originalTitle,
@@ -3058,7 +3183,35 @@ LIMIT $3`)
 			return err
 		}
 
-		return c.JSON(http.StatusOK, results)
+		hasMore := len(results) > limit
+		if hasMore {
+			results = results[:limit]
+		}
+
+		var nextCursor *string
+		if hasMore {
+			encoded, err := encodeSearchCursor(searchCursor{
+				Offset:      offset + limit,
+				Fingerprint: fingerprint,
+			})
+			if err != nil {
+				return err
+			}
+			nextCursor = &encoded
+		}
+
+		return c.JSON(http.StatusOK, SearchResponse{
+			Items: results,
+			Meta: SearchMeta{
+				Limit:      limit,
+				HasMore:    hasMore,
+				NextCursor: nextCursor,
+				AppliedFilters: SearchFilter{
+					Query: query,
+					Type:  titleType,
+				},
+			},
+		})
 	}
 }
 
@@ -3121,6 +3274,36 @@ func decodeDiscoverCursor(raw string) (discoverCursor, error) {
 		return cur, err
 	}
 	if cur.Tconst == "" || cur.Sort == "" || cur.Fingerprint == "" {
+		return cur, errors.New("invalid cursor payload")
+	}
+	return cur, nil
+}
+
+func searchFilterFingerprint(query, titleType string) string {
+	return strings.Join([]string{
+		strings.ToLower(strings.TrimSpace(query)),
+		titleType,
+	}, "|")
+}
+
+func encodeSearchCursor(cur searchCursor) (string, error) {
+	data, err := json.Marshal(cur)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(data), nil
+}
+
+func decodeSearchCursor(raw string) (searchCursor, error) {
+	var cur searchCursor
+	data, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return cur, err
+	}
+	if err := json.Unmarshal(data, &cur); err != nil {
+		return cur, err
+	}
+	if cur.Fingerprint == "" || cur.Offset < 1 {
 		return cur, errors.New("invalid cursor payload")
 	}
 	return cur, nil

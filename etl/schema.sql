@@ -21,8 +21,10 @@ CREATE TABLE IF NOT EXISTS title_search (
   start_year INT,
   primary_title TEXT,
   original_title TEXT,
-  aka_titles TEXT[]
+  aka_titles TEXT[],
+  popularity INT
 );
+ALTER TABLE title_search ADD COLUMN IF NOT EXISTS popularity INT;
 
 CREATE TABLE IF NOT EXISTS discover_core (
   tconst TEXT,

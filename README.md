@@ -33,6 +33,12 @@ Returns the full JSON blob for a title.
 Search (BM25 via ParadeDB):
 - `GET /search?query=...&type=series&limit=20`
 - `GET /search?query=...&type=movies&limit=20`
+- `GET /search?query=...&type=movies&limit=20&cursor=...`
+
+Search query notes:
+- `type` is required: `series` or `movies`
+- Uses boosted relevance across title fields with typo tolerance
+- `cursor` enables pagination; response includes `meta.nextCursor`
 
 Discover:
 - `GET /discover?type=series&year_from=2020&year_to=2023&genres=horror,mystery&sort=popular&limit=20`

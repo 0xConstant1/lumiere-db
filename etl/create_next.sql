@@ -24,7 +24,8 @@ CREATE TABLE title_search_next (
   start_year INT,
   primary_title TEXT,
   original_title TEXT,
-  aka_titles TEXT[]
+  aka_titles TEXT[],
+  popularity INT
 );
 ALTER TABLE title_search_next SET (autovacuum_enabled = false);
 
