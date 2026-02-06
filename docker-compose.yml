@@ -24,14 +24,21 @@ services:
       context: .
       dockerfile: api/Dockerfile
     container_name: lumiere_api
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     environment:
       DATABASE_URL: postgresql://user:password@db:5432/mydatabase
       IMDB_DATA_DIR: /data
       ENABLE_PG_SEARCH: true
       RUN_ETL: "true"
+      ETL_SCHEDULE_ENABLED: "true"
+      ETL_POLL_INTERVAL: "1h"
+      ETL_BOOTSTRAP_BLOCKING: "true"
       ETL_KEEP_STAGING: "true"
       ETL_LOAD_BATCH_SIZE: "20000"
       ETL_BATCH_SIZE: "20000"
+      ETL_DOWNLOAD_CONCURRENCY: "3"
       ETL_MAX_PARALLEL_WORKERS: "6"
       ETL_WORK_MEM: "64MB"
       ETL_MAINTENANCE_WORK_MEM: "1GB"

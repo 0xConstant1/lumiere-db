@@ -24,9 +24,23 @@ CREATE TABLE IF NOT EXISTS title_search (
   aka_titles TEXT[]
 );
 
-CREATE TABLE IF NOT EXISTS discover (
+CREATE TABLE IF NOT EXISTS discover_core (
   tconst TEXT,
   title_type TEXT,
+  type_group TEXT,
+  primary_title TEXT,
+  original_title TEXT,
+  start_year INT,
+  end_year INT,
+  genres TEXT[],
+  average_rating NUMERIC,
+  num_votes INT
+);
+
+CREATE TABLE IF NOT EXISTS discover_genre (
+  tconst TEXT,
+  title_type TEXT,
+  type_group TEXT,
   primary_title TEXT,
   original_title TEXT,
   start_year INT,
@@ -35,4 +49,11 @@ CREATE TABLE IF NOT EXISTS discover (
   average_rating NUMERIC,
   num_votes INT,
   genre TEXT
+);
+
+CREATE TABLE IF NOT EXISTS etl_source_state (
+  file_name TEXT PRIMARY KEY,
+  last_modified TIMESTAMPTZ NOT NULL,
+  content_length BIGINT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

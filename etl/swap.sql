@@ -1,80 +1,48 @@
 BEGIN;
 SET LOCAL synchronous_commit = off;
-TRUNCATE titles;
-INSERT INTO titles (
-  tconst,
-  title_type,
-  primary_title,
-  original_title,
-  start_year,
-  end_year,
-  is_adult,
-  runtime_minutes,
-  genres,
-  average_rating,
-  num_votes,
-  data,
-  dataset_date,
-  schema_version
-)
-SELECT
-  tconst,
-  title_type,
-  primary_title,
-  original_title,
-  start_year,
-  end_year,
-  is_adult,
-  runtime_minutes,
-  genres,
-  average_rating,
-  num_votes,
-  data,
-  dataset_date,
-  schema_version
-FROM titles_next;
+SET LOCAL lock_timeout = '{{swap_lock_timeout}}';
 
-TRUNCATE title_search;
-INSERT INTO title_search (
-  tconst,
-  title_type,
-  start_year,
-  primary_title,
-  original_title,
-  aka_titles
-)
-SELECT
-  tconst,
-  title_type,
-  start_year,
-  primary_title,
-  original_title,
-  aka_titles
-FROM title_search_next;
+LOCK TABLE
+  titles,
+  title_search,
+  discover_core,
+  discover_genre,
+  titles_next,
+  title_search_next,
+  discover_core_next,
+  discover_genre_next
+IN ACCESS EXCLUSIVE MODE;
 
-TRUNCATE discover;
-INSERT INTO discover (
-  tconst,
-  title_type,
-  primary_title,
-  original_title,
-  start_year,
-  end_year,
-  genres,
-  average_rating,
-  num_votes,
-  genre
-)
-SELECT
-  tconst,
-  title_type,
-  primary_title,
-  original_title,
-  start_year,
-  end_year,
-  genres,
-  average_rating,
-  num_votes,
-  genre
-FROM discover_next;
+DROP TABLE IF EXISTS titles_prev;
+DROP TABLE IF EXISTS title_search_prev;
+DROP TABLE IF EXISTS discover_core_prev;
+DROP TABLE IF EXISTS discover_genre_prev;
+
+ALTER TABLE titles RENAME TO titles_prev;
+ALTER TABLE title_search RENAME TO title_search_prev;
+ALTER TABLE discover_core RENAME TO discover_core_prev;
+ALTER TABLE discover_genre RENAME TO discover_genre_prev;
+
+ALTER TABLE titles_next RENAME TO titles;
+ALTER TABLE title_search_next RENAME TO title_search;
+ALTER TABLE discover_core_next RENAME TO discover_core;
+ALTER TABLE discover_genre_next RENAME TO discover_genre;
+
+DROP TABLE titles_prev;
+DROP TABLE title_search_prev;
+DROP TABLE discover_core_prev;
+DROP TABLE discover_genre_prev;
+
+ALTER TABLE titles RENAME CONSTRAINT titles_next_pkey TO titles_pkey;
+ALTER TABLE title_search RENAME CONSTRAINT title_search_next_pkey TO title_search_pkey;
+
+ALTER INDEX IF EXISTS idx_titles_next_type_year RENAME TO idx_titles_type_year;
+ALTER INDEX IF EXISTS idx_titles_next_genres_gin RENAME TO idx_titles_genres_gin;
+ALTER INDEX IF EXISTS idx_titles_next_type_votes RENAME TO idx_titles_type_votes;
+ALTER INDEX IF EXISTS idx_titles_next_tvseries_votes RENAME TO idx_titles_tv_votes;
+ALTER INDEX IF EXISTS idx_discover_core_next_group_votes RENAME TO idx_discover_core_group_votes;
+ALTER INDEX IF EXISTS idx_discover_core_next_group_year_votes RENAME TO idx_discover_core_group_year_votes;
+ALTER INDEX IF EXISTS idx_discover_genre_next_group_genre_votes RENAME TO idx_discover_genre_group_genre_votes;
+ALTER INDEX IF EXISTS idx_discover_genre_next_group_genre_year_votes RENAME TO idx_discover_genre_group_genre_year_votes;
+ALTER INDEX IF EXISTS title_search_next_bm25 RENAME TO title_search_bm25;
 COMMIT;

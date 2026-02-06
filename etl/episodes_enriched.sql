@@ -3,12 +3,12 @@ CREATE UNLOGGED TABLE stg_episode_enriched AS
 SELECT
   e.parentTconst AS parent_tconst,
   e.tconst AS tconst,
-  NULLIF(NULLIF(BTRIM(e.seasonNumber), '\N'), '')::INT AS season_number,
-  NULLIF(NULLIF(BTRIM(e.episodeNumber), '\N'), '')::INT AS episode_number,
+  e.seasonNumber AS season_number,
+  e.episodeNumber AS episode_number,
   b.primaryTitle AS primary_title,
-  NULLIF(NULLIF(BTRIM(b.startYear), '\N'), '')::INT AS start_year,
-  NULLIF(NULLIF(BTRIM(r.averageRating), '\N'), '')::NUMERIC AS average_rating,
-  NULLIF(NULLIF(BTRIM(r.numVotes), '\N'), '')::INT AS num_votes
+  b.startYear AS start_year,
+  r.averageRating AS average_rating,
+  r.numVotes AS num_votes
 FROM stg_title_episode e
 JOIN stg_title_basics b ON b.tconst = e.tconst
 LEFT JOIN stg_title_ratings r ON r.tconst = e.tconst;

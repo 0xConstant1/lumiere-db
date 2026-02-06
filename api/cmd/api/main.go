@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -47,6 +48,7 @@ type Config struct {
 	MaintenanceWorkMem              string
 	Port                            string
 	ReaderBufferSize                int
+	DownloadConcurrency             int
 	MinNumVotes                     int
 	DBMaxWalSize                    string
 	DBMinWalSize                    string
@@ -55,6 +57,11 @@ type Config struct {
 	DBWalCompression                string
 	DBMaxParallelWorkers            string
 	DBMaxParallelMaintenanceWorkers string
+	ScheduleEnabled                 bool
+	PollInterval                    time.Duration
+	BootstrapBlocking               bool
+	ForceRebuild                    bool
+	SwapLockTimeout                 string
 }
 
 type TitleBasics struct {
@@ -148,6 +155,24 @@ type seasonKey struct {
 	Value    int
 }
 
+type imdbFileState struct {
+	FileName      string
+	LastModified  time.Time
+	ContentLength int64
+}
+
+var imdbDatasetFiles = []string{
+	"title.basics.tsv.gz",
+	"title.akas.tsv.gz",
+	"title.ratings.tsv.gz",
+	"title.principals.tsv.gz",
+	"title.crew.tsv.gz",
+	"title.episode.tsv.gz",
+	"name.basics.tsv.gz",
+}
+
+const etlSchedulerLockKey int64 = 573901235911
+
 func envString(key, def string) string {
 	val := strings.TrimSpace(os.Getenv(key))
 	if val == "" {
@@ -181,6 +206,18 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return parsed
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		return def
+	}
+	dur, err := time.ParseDuration(val)
+	if err != nil {
+		return def
+	}
+	return dur
 }
 
 func resolveSQLDir(envVal string) (string, error) {
@@ -512,8 +549,24 @@ func main() {
 	defer pool.Close()
 
 	if cfg.RunETL {
-		if err := runETL(ctx, pool, cfg, logger); err != nil {
-			logger.Fatalf("etl failed: %v", err)
+		if cfg.ScheduleEnabled {
+			needsBootstrap, err := shouldRunBlockingBootstrap(ctx, pool)
+			if err != nil {
+				logger.Fatalf("etl bootstrap check failed: %v", err)
+			}
+			if needsBootstrap && cfg.BootstrapBlocking {
+				logger.Printf("etl: bootstrap run started (titles table is empty)")
+				if err := runScheduledRebuildCycle(ctx, pool, cfg, logger); err != nil {
+					logger.Fatalf("etl bootstrap failed: %v", err)
+				}
+			} else if needsBootstrap {
+				logger.Printf("etl: bootstrap run deferred to scheduler (ETL_BOOTSTRAP_BLOCKING=false)")
+			}
+			startETLScheduler(ctx, pool, cfg, logger)
+		} else {
+			if err := runETL(ctx, pool, cfg, logger); err != nil {
+				logger.Fatalf("etl failed: %v", err)
+			}
 		}
 	} else {
 		logger.Printf("etl: skipped (RUN_ETL=false)")
@@ -549,6 +602,7 @@ func loadConfig() (Config, error) {
 	cfg.WorkMem = strings.TrimSpace(os.Getenv("ETL_WORK_MEM"))
 	cfg.MaintenanceWorkMem = strings.TrimSpace(os.Getenv("ETL_MAINTENANCE_WORK_MEM"))
 	cfg.ReaderBufferSize = clampPositive(envInt("ETL_READER_BUFFER", 256*1024), 256*1024)
+	cfg.DownloadConcurrency = clampPositive(envInt("ETL_DOWNLOAD_CONCURRENCY", 3), 3)
 	cfg.MinNumVotes = clampNonNegative(envInt("ETL_MIN_NUMVOTES", 1))
 	cfg.DBMaxWalSize = strings.TrimSpace(os.Getenv("ETL_DB_MAX_WAL_SIZE"))
 	cfg.DBMinWalSize = strings.TrimSpace(os.Getenv("ETL_DB_MIN_WAL_SIZE"))
@@ -557,6 +611,17 @@ func loadConfig() (Config, error) {
 	cfg.DBWalCompression = strings.TrimSpace(os.Getenv("ETL_DB_WAL_COMPRESSION"))
 	cfg.DBMaxParallelWorkers = strings.TrimSpace(os.Getenv("ETL_DB_MAX_PARALLEL_WORKERS"))
 	cfg.DBMaxParallelMaintenanceWorkers = strings.TrimSpace(os.Getenv("ETL_DB_MAX_PARALLEL_MAINTENANCE_WORKERS"))
+	cfg.ScheduleEnabled = envBool("ETL_SCHEDULE_ENABLED", true)
+	cfg.PollInterval = envDuration("ETL_POLL_INTERVAL", time.Hour)
+	if cfg.PollInterval <= 0 {
+		return cfg, errors.New("ETL_POLL_INTERVAL must be greater than 0")
+	}
+	cfg.BootstrapBlocking = envBool("ETL_BOOTSTRAP_BLOCKING", true)
+	cfg.ForceRebuild = envBool("IMDB_FORCE_REBUILD", false)
+	cfg.SwapLockTimeout = envString("ETL_SWAP_LOCK_TIMEOUT", "30s")
+	if strings.Contains(cfg.SwapLockTimeout, "'") || strings.Contains(cfg.SwapLockTimeout, ";") {
+		return cfg, errors.New("ETL_SWAP_LOCK_TIMEOUT contains invalid character")
+	}
 	cfg.Port = envString("PORT", "8000")
 
 	sqlDir, err := resolveSQLDir(os.Getenv("ETL_SQL_DIR"))
@@ -571,9 +636,9 @@ func loadConfig() (Config, error) {
 func runETL(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log.Logger) error {
 	logger.Printf("etl: starting")
 	logger.Printf(
-		"etl: config base_url=%s data_dir=%s sql_dir=%s dataset_date=%s schema_version=%d search=%v force_download=%v load_batch=%d build_batch=%d reader_buf=%d min_votes=%d",
+		"etl: config base_url=%s data_dir=%s sql_dir=%s dataset_date=%s schema_version=%d search=%v force_download=%v load_batch=%d build_batch=%d reader_buf=%d download_workers=%d min_votes=%d",
 		cfg.BaseURL, cfg.DataDir, cfg.SQLDir, cfg.DatasetDate, cfg.SchemaVersion, cfg.EnablePGSearch, cfg.ForceDownload, cfg.LoadBatchSize, cfg.BatchSize,
-		cfg.ReaderBufferSize, cfg.MinNumVotes,
+		cfg.ReaderBufferSize, cfg.DownloadConcurrency, cfg.MinNumVotes,
 	)
 
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
@@ -624,13 +689,16 @@ func runETL(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log.Log
 
 	postScripts := []string{
 		"discover_next.sql",
-		"swap.sql",
-		"indexes_final.sql",
+		"indexes_next.sql",
+		"analyze.sql",
 	}
 	if cfg.EnablePGSearch {
-		postScripts = append(postScripts, "pg_search_final.sql")
+		postScripts = append(postScripts, "pg_search_next.sql")
 	}
-	postScripts = append(postScripts, "analyze_final.sql")
+	postScripts = append(postScripts,
+		"swap.sql",
+		"analyze_final.sql",
+	)
 	if cfg.KeepStaging {
 		logger.Printf("etl: cleanup skipped (ETL_KEEP_STAGING=true)")
 	} else {
@@ -658,6 +726,7 @@ func runSQLFile(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log
 	sqlText = strings.ReplaceAll(sqlText, "{{dataset_date}}", cfg.DatasetDate)
 	sqlText = strings.ReplaceAll(sqlText, "{{schema_version}}", strconv.Itoa(cfg.SchemaVersion))
 	sqlText = strings.ReplaceAll(sqlText, "{{min_num_votes}}", strconv.Itoa(cfg.MinNumVotes))
+	sqlText = strings.ReplaceAll(sqlText, "{{swap_lock_timeout}}", cfg.SwapLockTimeout)
 
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
@@ -769,23 +838,363 @@ func applySystemSettings(ctx context.Context, conn *pgxpool.Conn, cfg Config, lo
 	return nil
 }
 
-func downloadDatasets(ctx context.Context, cfg Config, logger *log.Logger) error {
-	files := []string{
-		"title.basics.tsv.gz",
-		"title.akas.tsv.gz",
-		"title.ratings.tsv.gz",
-		"title.principals.tsv.gz",
-		"title.crew.tsv.gz",
-		"title.episode.tsv.gz",
-		"name.basics.tsv.gz",
+func startETLScheduler(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log.Logger) {
+	logger.Printf("etl: scheduler enabled poll_interval=%s", cfg.PollInterval)
+	go func() {
+		if err := runScheduledRebuildCycle(ctx, pool, cfg, logger); err != nil {
+			logger.Printf("etl: scheduler cycle failed: %v", err)
+		}
+
+		ticker := time.NewTicker(cfg.PollInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := runScheduledRebuildCycle(ctx, pool, cfg, logger); err != nil {
+					logger.Printf("etl: scheduler cycle failed: %v", err)
+				}
+			}
+		}
+	}()
+}
+
+func runScheduledRebuildCycle(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log.Logger) error {
+	manifest, err := probeIMDbFileStates(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("probe imdb headers: %w", err)
 	}
 
+	prevState, err := loadSourceState(ctx, pool)
+	if err != nil {
+		return fmt.Errorf("load etl source state: %w", err)
+	}
+
+	if cfg.ForceRebuild {
+		logger.Printf("etl: force rebuild enabled (IMDB_FORCE_REBUILD=true)")
+	}
+	if !cfg.ForceRebuild {
+		changedCount, allUpdated := compareStateSets(prevState, manifest)
+		if len(prevState) == 0 {
+			logger.Printf("etl: no previous source state; full rebuild required")
+		} else if !allUpdated {
+			logger.Printf("etl: skip rebuild changed_files=%d/%d (requires all files changed)", changedCount, len(imdbDatasetFiles))
+			return nil
+		}
+	}
+
+	lockConn, locked, err := acquireETLSchedulerLock(ctx, pool)
+	if err != nil {
+		return fmt.Errorf("acquire etl lock: %w", err)
+	}
+	if !locked {
+		logger.Printf("etl: skip rebuild (lock held by another instance)")
+		return nil
+	}
+	defer releaseETLSchedulerLock(lockConn)
+
+	if !cfg.ForceRebuild {
+		prevState, err = loadSourceState(ctx, pool)
+		if err != nil {
+			return fmt.Errorf("reload etl source state: %w", err)
+		}
+		changedCount, allUpdated := compareStateSets(prevState, manifest)
+		if len(prevState) > 0 && !allUpdated {
+			logger.Printf("etl: skip rebuild after lock changed_files=%d/%d", changedCount, len(imdbDatasetFiles))
+			return nil
+		}
+	}
+
+	rebuildCfg := cfg
+	rebuildCfg.DatasetDate = datasetDateFromState(manifest)
+	rebuildCfg.ForceDownload = true
+
+	logger.Printf("etl: scheduled rebuild triggered dataset_date=%s", rebuildCfg.DatasetDate)
+	if err := runETL(ctx, pool, rebuildCfg, logger); err != nil {
+		return err
+	}
+
+	if err := saveSourceState(ctx, pool, manifest); err != nil {
+		return fmt.Errorf("persist source state: %w", err)
+	}
+	logger.Printf("etl: scheduled rebuild completed")
+	return nil
+}
+
+func shouldRunBlockingBootstrap(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
+	hasRows, err := hasAnyTitles(ctx, pool)
+	if err != nil {
+		return false, err
+	}
+	return !hasRows, nil
+}
+
+func hasAnyTitles(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
+	hasTable, err := tableExists(ctx, pool, "public.titles")
+	if err != nil {
+		return false, err
+	}
+	if !hasTable {
+		return false, nil
+	}
+
+	var exists bool
+	err = pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM titles LIMIT 1)`).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+func tableExists(ctx context.Context, pool *pgxpool.Pool, qualifiedName string) (bool, error) {
+	var exists bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, qualifiedName).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+func probeIMDbFileStates(ctx context.Context, cfg Config) (map[string]imdbFileState, error) {
 	baseURL := strings.TrimRight(cfg.BaseURL, "/")
-	for _, file := range files {
-		logger.Printf("etl: download %s", file)
-		if err := downloadFile(ctx, baseURL, cfg.DataDir, file, cfg.ForceDownload, logger); err != nil {
+	client := &http.Client{Timeout: 30 * time.Second}
+	state := make(map[string]imdbFileState, len(imdbDatasetFiles))
+	for _, file := range imdbDatasetFiles {
+		url := baseURL + "/" + file
+		req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("%s: build request: %w", file, err)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("%s: head request: %w", file, err)
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("%s: head status %s", file, resp.Status)
+		}
+
+		lastModifiedRaw := strings.TrimSpace(resp.Header.Get("Last-Modified"))
+		if lastModifiedRaw == "" {
+			return nil, fmt.Errorf("%s: missing Last-Modified header on 200 response", file)
+		}
+
+		contentLengthRaw := strings.TrimSpace(resp.Header.Get("Content-Length"))
+		if contentLengthRaw == "" {
+			return nil, fmt.Errorf("%s: missing Content-Length header on 200 response", file)
+		}
+
+		lastModified, err := http.ParseTime(lastModifiedRaw)
+		if err != nil {
+			return nil, fmt.Errorf("%s: parse Last-Modified: %w", file, err)
+		}
+
+		contentLength, err := strconv.ParseInt(contentLengthRaw, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("%s: parse Content-Length: %w", file, err)
+		}
+		if contentLength < 0 {
+			return nil, fmt.Errorf("%s: invalid Content-Length %d", file, contentLength)
+		}
+
+		state[file] = imdbFileState{
+			FileName:      file,
+			LastModified:  lastModified.UTC(),
+			ContentLength: contentLength,
+		}
+	}
+	return state, nil
+}
+
+func compareStateSets(previous map[string]imdbFileState, current map[string]imdbFileState) (int, bool) {
+	if len(previous) == 0 || len(current) == 0 {
+		return 0, false
+	}
+	changedCount := 0
+	for _, file := range imdbDatasetFiles {
+		prev, okPrev := previous[file]
+		curr, okCurr := current[file]
+		if !okPrev || !okCurr {
+			return changedCount, false
+		}
+		if prev.LastModified.Equal(curr.LastModified) && prev.ContentLength == curr.ContentLength {
+			continue
+		}
+		changedCount++
+	}
+	return changedCount, changedCount == len(imdbDatasetFiles)
+}
+
+func datasetDateFromState(state map[string]imdbFileState) string {
+	if len(state) == 0 {
+		return time.Now().UTC().Format("2006-01-02")
+	}
+	maxTime := time.Time{}
+	for _, file := range imdbDatasetFiles {
+		entry, ok := state[file]
+		if !ok {
+			continue
+		}
+		if entry.LastModified.After(maxTime) {
+			maxTime = entry.LastModified
+		}
+	}
+	if maxTime.IsZero() {
+		maxTime = time.Now().UTC()
+	}
+	return maxTime.UTC().Format("2006-01-02")
+}
+
+func loadSourceState(ctx context.Context, pool *pgxpool.Pool) (map[string]imdbFileState, error) {
+	exists, err := tableExists(ctx, pool, "public.etl_source_state")
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return map[string]imdbFileState{}, nil
+	}
+
+	rows, err := pool.Query(ctx, `
+SELECT file_name, last_modified, content_length
+FROM etl_source_state`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	state := make(map[string]imdbFileState)
+	for rows.Next() {
+		var (
+			fileName      string
+			lastModified  time.Time
+			contentLength int64
+		)
+		if err := rows.Scan(&fileName, &lastModified, &contentLength); err != nil {
+			return nil, err
+		}
+		state[fileName] = imdbFileState{
+			FileName:      fileName,
+			LastModified:  lastModified.UTC(),
+			ContentLength: contentLength,
+		}
+	}
+	return state, rows.Err()
+}
+
+func saveSourceState(ctx context.Context, pool *pgxpool.Pool, state map[string]imdbFileState) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	for _, file := range imdbDatasetFiles {
+		entry, ok := state[file]
+		if !ok {
+			return fmt.Errorf("missing source state for %s", file)
+		}
+		if _, err := tx.Exec(ctx, `
+INSERT INTO etl_source_state (file_name, last_modified, content_length, updated_at)
+VALUES ($1, $2, $3, now())
+ON CONFLICT (file_name) DO UPDATE
+SET last_modified = EXCLUDED.last_modified,
+    content_length = EXCLUDED.content_length,
+    updated_at = now()`,
+			entry.FileName,
+			entry.LastModified,
+			entry.ContentLength,
+		); err != nil {
 			return err
 		}
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM etl_source_state WHERE NOT (file_name = ANY($1))`, imdbDatasetFiles); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+func acquireETLSchedulerLock(ctx context.Context, pool *pgxpool.Pool) (*pgxpool.Conn, bool, error) {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+
+	var locked bool
+	if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", etlSchedulerLockKey).Scan(&locked); err != nil {
+		conn.Release()
+		return nil, false, err
+	}
+
+	if !locked {
+		conn.Release()
+		return nil, false, nil
+	}
+	return conn, true, nil
+}
+
+func releaseETLSchedulerLock(conn *pgxpool.Conn) {
+	if conn == nil {
+		return
+	}
+	_, _ = conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", etlSchedulerLockKey)
+	conn.Release()
+}
+
+func downloadDatasets(ctx context.Context, cfg Config, logger *log.Logger) error {
+	baseURL := strings.TrimRight(cfg.BaseURL, "/")
+	workerCount := clampPositive(cfg.DownloadConcurrency, 3)
+	if workerCount > len(imdbDatasetFiles) {
+		workerCount = len(imdbDatasetFiles)
+	}
+
+	jobs := make(chan string, len(imdbDatasetFiles))
+	for _, file := range imdbDatasetFiles {
+		jobs <- file
+	}
+	close(jobs)
+
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 1)
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for file := range jobs {
+				if workerCtx.Err() != nil {
+					return
+				}
+				logger.Printf("etl: download %s", file)
+				if err := downloadFile(workerCtx, baseURL, cfg.DataDir, file, cfg.ForceDownload, logger); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					cancel()
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return err
+	default:
+	}
+	if workerCtx.Err() != nil && !errors.Is(workerCtx.Err(), context.Canceled) {
+		return workerCtx.Err()
 	}
 	return nil
 }
@@ -845,11 +1254,21 @@ type tsvLoadSpec struct {
 	File      string
 	Table     string
 	Columns   []string
+	Types     []tsvColumnType
 	Indexes   []int
 	Filter    func([]string) bool
 	FilterRaw func(string) bool
 	OnRecord  func([]string)
 }
+
+type tsvColumnType uint8
+
+const (
+	tsvColumnText tsvColumnType = iota
+	tsvColumnInt
+	tsvColumnFloat
+	tsvColumnBool01
+)
 
 func loadStagingInBatches(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log.Logger) error {
 	datasetDate, err := time.Parse("2006-01-02", cfg.DatasetDate)
@@ -941,6 +1360,10 @@ func loadStagingInBatches(ctx context.Context, pool *pgxpool.Pool, cfg Config, l
 		Columns: []string{
 			"tconst", "titletype", "primarytitle", "originaltitle", "isadult", "startyear", "endyear", "runtimeminutes", "genres",
 		},
+		Types: []tsvColumnType{
+			tsvColumnText, tsvColumnText, tsvColumnText, tsvColumnText,
+			tsvColumnBool01, tsvColumnInt, tsvColumnInt, tsvColumnInt, tsvColumnText,
+		},
 		FilterRaw: allowedTitleTypeRaw,
 		OnRecord: func(record []string) {
 			if len(record) == 0 {
@@ -959,7 +1382,7 @@ func loadStagingInBatches(ctx context.Context, pool *pgxpool.Pool, cfg Config, l
 		},
 	}
 	path := filepath.Join(cfg.DataDir, basicsSpec.File)
-	if err := loadTSVToTable(ctx, conn, path, basicsSpec.Table, basicsSpec.Columns, basicsSpec.Indexes, cfg.LoadBatchSize, cfg.ReaderBufferSize, basicsSpec.Filter, basicsSpec.FilterRaw, basicsSpec.OnRecord, logger); err != nil {
+	if err := loadTSVToTable(ctx, conn, path, basicsSpec.Table, basicsSpec.Columns, basicsSpec.Types, basicsSpec.Indexes, cfg.LoadBatchSize, cfg.ReaderBufferSize, basicsSpec.Filter, basicsSpec.FilterRaw, basicsSpec.OnRecord, logger); err != nil {
 		return err
 	}
 	logger.Printf("etl: allowlist type=%d current_year=%d", len(typeAllowlist), len(currentYearSet))
@@ -969,6 +1392,9 @@ func loadStagingInBatches(ctx context.Context, pool *pgxpool.Pool, cfg Config, l
 		Table: "stg_title_ratings",
 		Columns: []string{
 			"tconst", "averagerating", "numvotes",
+		},
+		Types: []tsvColumnType{
+			tsvColumnText, tsvColumnFloat, tsvColumnInt,
 		},
 		FilterRaw: func(line string) bool {
 			return allowlistFilter(line, 0, typeAllowlist)
@@ -991,7 +1417,7 @@ func loadStagingInBatches(ctx context.Context, pool *pgxpool.Pool, cfg Config, l
 		},
 	}
 	path = filepath.Join(cfg.DataDir, ratingsSpec.File)
-	if err := loadTSVToTable(ctx, conn, path, ratingsSpec.Table, ratingsSpec.Columns, ratingsSpec.Indexes, cfg.LoadBatchSize, cfg.ReaderBufferSize, ratingsSpec.Filter, ratingsSpec.FilterRaw, ratingsSpec.OnRecord, logger); err != nil {
+	if err := loadTSVToTable(ctx, conn, path, ratingsSpec.Table, ratingsSpec.Columns, ratingsSpec.Types, ratingsSpec.Indexes, cfg.LoadBatchSize, cfg.ReaderBufferSize, ratingsSpec.Filter, ratingsSpec.FilterRaw, ratingsSpec.OnRecord, logger); err != nil {
 		return err
 	}
 	logger.Printf("etl: allowlist voted=%d min_votes=%d", len(votedSet), cfg.MinNumVotes)
@@ -1016,6 +1442,10 @@ func loadStagingInBatches(ctx context.Context, pool *pgxpool.Pool, cfg Config, l
 			Columns: []string{
 				"titleid", "ordering", "title", "region", "language", "types", "attributes", "isoriginaltitle",
 			},
+			Types: []tsvColumnType{
+				tsvColumnText, tsvColumnInt, tsvColumnText, tsvColumnText,
+				tsvColumnText, tsvColumnText, tsvColumnText, tsvColumnBool01,
+			},
 			FilterRaw: func(line string) bool {
 				return allowlistFilter(line, 0, finalAllowlist)
 			},
@@ -1025,6 +1455,9 @@ func loadStagingInBatches(ctx context.Context, pool *pgxpool.Pool, cfg Config, l
 			Table: "stg_title_principals",
 			Columns: []string{
 				"tconst", "ordering", "nconst", "category", "characters",
+			},
+			Types: []tsvColumnType{
+				tsvColumnText, tsvColumnInt, tsvColumnText, tsvColumnText, tsvColumnText,
 			},
 			Indexes: []int{0, 1, 2, 3, 5},
 			FilterRaw: func(line string) bool {
@@ -1045,6 +1478,9 @@ func loadStagingInBatches(ctx context.Context, pool *pgxpool.Pool, cfg Config, l
 			Columns: []string{
 				"tconst", "directors", "writers",
 			},
+			Types: []tsvColumnType{
+				tsvColumnText, tsvColumnText, tsvColumnText,
+			},
 			FilterRaw: func(line string) bool {
 				return allowlistFilter(line, 0, finalAllowlist)
 			},
@@ -1063,6 +1499,9 @@ func loadStagingInBatches(ctx context.Context, pool *pgxpool.Pool, cfg Config, l
 			Columns: []string{
 				"tconst", "parenttconst", "seasonnumber", "episodenumber",
 			},
+			Types: []tsvColumnType{
+				tsvColumnText, tsvColumnText, tsvColumnInt, tsvColumnInt,
+			},
 			FilterRaw: func(line string) bool {
 				return allowlistFilter(line, 1, finalAllowlist)
 			},
@@ -1072,6 +1511,9 @@ func loadStagingInBatches(ctx context.Context, pool *pgxpool.Pool, cfg Config, l
 			Table: "stg_name_basics",
 			Columns: []string{
 				"nconst", "primaryname",
+			},
+			Types: []tsvColumnType{
+				tsvColumnText, tsvColumnText,
 			},
 			Indexes: []int{0, 1},
 			FilterRaw: func(line string) bool {
@@ -1091,7 +1533,7 @@ func loadStagingInBatches(ctx context.Context, pool *pgxpool.Pool, cfg Config, l
 
 	for _, spec := range specs {
 		path := filepath.Join(cfg.DataDir, spec.File)
-		if err := loadTSVToTable(ctx, conn, path, spec.Table, spec.Columns, spec.Indexes, cfg.LoadBatchSize, cfg.ReaderBufferSize, spec.Filter, spec.FilterRaw, spec.OnRecord, logger); err != nil {
+		if err := loadTSVToTable(ctx, conn, path, spec.Table, spec.Columns, spec.Types, spec.Indexes, cfg.LoadBatchSize, cfg.ReaderBufferSize, spec.Filter, spec.FilterRaw, spec.OnRecord, logger); err != nil {
 			return err
 		}
 	}
@@ -1104,7 +1546,8 @@ func loadStagingInBatches(ctx context.Context, pool *pgxpool.Pool, cfg Config, l
 	return nil
 }
 
-func loadTSVToTable(ctx context.Context, conn *pgxpool.Conn, path, table string, columns []string, indexes []int, batchSize int, readerBuffer int, filter func([]string) bool, filterRaw func(string) bool, onRecord func([]string), logger *log.Logger) error {
+func loadTSVToTable(ctx context.Context, conn *pgxpool.Conn, path, table string, columns []string, columnTypes []tsvColumnType, indexes []int, batchSize int, readerBuffer int, filter func([]string) bool, filterRaw func(string) bool, onRecord func([]string), logger *log.Logger) error {
+	_ = batchSize
 	start := time.Now()
 	logger.Printf("etl: load %s -> %s", filepath.Base(path), table)
 
@@ -1127,7 +1570,7 @@ func loadTSVToTable(ctx context.Context, conn *pgxpool.Conn, path, table string,
 		reader = bufio.NewReader(gz)
 	}
 
-	source := newTSVCopySource(reader, columns, indexes, filter, filterRaw, onRecord, logger, table, start)
+	source := newTSVCopySource(reader, columns, columnTypes, indexes, filter, filterRaw, onRecord, logger, table, start)
 	if _, err := conn.CopyFrom(ctx, pgx.Identifier{table}, columns, source); err != nil {
 		return fmt.Errorf("copy %s: %w", table, err)
 	}
@@ -1147,20 +1590,24 @@ func loadTSVToTable(ctx context.Context, conn *pgxpool.Conn, path, table string,
 }
 
 type tsvCopySource struct {
-	reader    *bufio.Reader
-	columns   []string
-	indexes   []int
-	filter    func([]string) bool
-	filterRaw func(string) bool
-	onRecord  func([]string)
-	logger    *log.Logger
-	table     string
-	start     time.Time
+	reader      *bufio.Reader
+	columns     []string
+	columnTypes []tsvColumnType
+	indexes     []int
+	filter      func([]string) bool
+	filterRaw   func(string) bool
+	onRecord    func([]string)
+	logger      *log.Logger
+	table       string
+	start       time.Time
 
 	headerRead bool
 	sourceLen  int
+	maxIndex   int
 	row        []any
 	err        error
+	fullRecord []string
+	record     []string
 
 	scanned  int
 	inserted int
@@ -1169,18 +1616,131 @@ type tsvCopySource struct {
 	logEvery int
 }
 
-func newTSVCopySource(reader *bufio.Reader, columns []string, indexes []int, filter func([]string) bool, filterRaw func(string) bool, onRecord func([]string), logger *log.Logger, table string, start time.Time) *tsvCopySource {
+func newTSVCopySource(reader *bufio.Reader, columns []string, columnTypes []tsvColumnType, indexes []int, filter func([]string) bool, filterRaw func(string) bool, onRecord func([]string), logger *log.Logger, table string, start time.Time) *tsvCopySource {
+	types := columnTypes
+	if len(types) != len(columns) {
+		types = make([]tsvColumnType, len(columns))
+		for i := range types {
+			types[i] = tsvColumnText
+		}
+	}
+	maxIdx := -1
+	for _, idx := range indexes {
+		if idx > maxIdx {
+			maxIdx = idx
+		}
+	}
 	return &tsvCopySource{
-		reader:    reader,
-		columns:   columns,
-		indexes:   indexes,
-		filter:    filter,
-		filterRaw: filterRaw,
-		onRecord:  onRecord,
-		logger:    logger,
-		table:     table,
-		start:     start,
-		logEvery:  500000,
+		reader:      reader,
+		columns:     columns,
+		columnTypes: types,
+		indexes:     indexes,
+		filter:      filter,
+		filterRaw:   filterRaw,
+		onRecord:    onRecord,
+		logger:      logger,
+		table:       table,
+		start:       start,
+		maxIndex:    maxIdx,
+		row:         make([]any, len(columns)),
+		logEvery:    500000,
+	}
+}
+
+func trimLineEnding(line string) string {
+	if len(line) == 0 {
+		return line
+	}
+	if line[len(line)-1] == '\n' {
+		line = line[:len(line)-1]
+	}
+	if len(line) > 0 && line[len(line)-1] == '\r' {
+		line = line[:len(line)-1]
+	}
+	return line
+}
+
+func countTSVColumns(line string) int {
+	if line == "" {
+		return 0
+	}
+	count := 1
+	for i := 0; i < len(line); i++ {
+		if line[i] == '\t' {
+			count++
+		}
+	}
+	return count
+}
+
+func parseTSVRecord(line string, expected int, dst []string) []string {
+	if expected <= 0 {
+		return dst[:0]
+	}
+	if cap(dst) < expected {
+		dst = make([]string, expected)
+	} else {
+		dst = dst[:expected]
+		for i := range dst {
+			dst[i] = ""
+		}
+	}
+
+	field := 0
+	start := 0
+	for i := 0; i <= len(line); i++ {
+		if i < len(line) && line[i] != '\t' {
+			continue
+		}
+		if field == expected-1 {
+			dst[field] = line[start:]
+			return dst
+		}
+		dst[field] = line[start:i]
+		field++
+		start = i + 1
+		if field >= expected {
+			return dst
+		}
+	}
+	return dst
+}
+
+func convertTSVValue(raw string, typ tsvColumnType) any {
+	switch typ {
+	case tsvColumnText:
+		return raw
+	case tsvColumnInt:
+		if raw == "" || raw == "\\N" {
+			return nil
+		}
+		val, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil
+		}
+		return val
+	case tsvColumnFloat:
+		if raw == "" || raw == "\\N" {
+			return nil
+		}
+		val, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return nil
+		}
+		return val
+	case tsvColumnBool01:
+		if raw == "" || raw == "\\N" {
+			return nil
+		}
+		if raw == "1" {
+			return true
+		}
+		if raw == "0" {
+			return false
+		}
+		return nil
+	default:
+		return raw
 	}
 }
 
@@ -1192,7 +1752,7 @@ func (s *tsvCopySource) readLine() (string, error) {
 	if errors.Is(err, io.EOF) && len(line) == 0 {
 		return "", io.EOF
 	}
-	return strings.TrimRight(line, "\r\n"), err
+	return trimLineEnding(line), err
 }
 
 func (s *tsvCopySource) Next() bool {
@@ -1216,21 +1776,12 @@ func (s *tsvCopySource) Next() bool {
 		}
 
 		if !s.headerRead {
-			header := strings.Split(line, "\t")
-			s.sourceLen = len(header)
+			s.sourceLen = countTSVColumns(line)
 			if len(s.indexes) == 0 && s.sourceLen != len(s.columns) {
 				s.logger.Printf("etl: warning %s header columns=%d expected=%d", s.table, s.sourceLen, len(s.columns))
 			}
-			if len(s.indexes) > 0 {
-				maxIdx := -1
-				for _, idx := range s.indexes {
-					if idx > maxIdx {
-						maxIdx = idx
-					}
-				}
-				if maxIdx >= s.sourceLen {
-					s.logger.Printf("etl: warning %s header columns=%d max_index=%d", s.table, s.sourceLen, maxIdx)
-				}
+			if len(s.indexes) > 0 && s.maxIndex >= s.sourceLen {
+				s.logger.Printf("etl: warning %s header columns=%d max_index=%d", s.table, s.sourceLen, s.maxIndex)
 			}
 			s.headerRead = true
 			if errors.Is(err, io.EOF) {
@@ -1248,29 +1799,23 @@ func (s *tsvCopySource) Next() bool {
 			continue
 		}
 
-		recordFull := strings.Split(line, "\t")
-		if len(recordFull) != s.sourceLen {
-			if len(recordFull) < s.sourceLen {
-				padded := make([]string, s.sourceLen)
-				copy(padded, recordFull)
-				recordFull = padded
-			} else {
-				merged := make([]string, s.sourceLen)
-				copy(merged, recordFull[:s.sourceLen-1])
-				merged[s.sourceLen-1] = strings.Join(recordFull[s.sourceLen-1:], "\t")
-				recordFull = merged
-			}
-		}
+		s.fullRecord = parseTSVRecord(line, s.sourceLen, s.fullRecord)
 
-		record := recordFull
+		record := s.fullRecord
 		if len(s.indexes) > 0 {
-			selected := make([]string, len(s.columns))
-			for i, idx := range s.indexes {
-				if idx >= 0 && idx < len(recordFull) {
-					selected[i] = recordFull[idx]
-				}
+			if cap(s.record) < len(s.columns) {
+				s.record = make([]string, len(s.columns))
+			} else {
+				s.record = s.record[:len(s.columns)]
 			}
-			record = selected
+			for i, idx := range s.indexes {
+				val := ""
+				if idx >= 0 && idx < len(s.fullRecord) {
+					val = s.fullRecord[idx]
+				}
+				s.record[i] = val
+			}
+			record = s.record
 		}
 
 		if s.filter != nil && !s.filter(record) {
@@ -1285,11 +1830,9 @@ func (s *tsvCopySource) Next() bool {
 			s.onRecord(record)
 		}
 
-		row := make([]any, len(s.columns))
 		for i := range s.columns {
-			row[i] = record[i]
+			s.row[i] = convertTSVValue(record[i], s.columnTypes[i])
 		}
-		s.row = row
 		s.inserted++
 
 		if s.scanned%s.logEvery == 0 {
@@ -1322,6 +1865,229 @@ func (s *tsvCopySource) Skipped() int {
 
 type queryer interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+type searchCopyRow struct {
+	Tconst        string
+	TitleType     string
+	StartYear     *int
+	PrimaryTitle  string
+	OriginalTitle string
+	AkaTitles     []string
+}
+
+type titlesNextCopySource struct {
+	cfg              Config
+	datasetDate      time.Time
+	tconsts          []string
+	basics           map[string]TitleBasics
+	ratings          map[string]Rating
+	akasByTitle      map[string]map[string][]Aka
+	actorsByTitle    map[string][]principalRow
+	producersByTitle map[string][]principalRow
+	crewByTitle      map[string]crewLists
+	episodesByTitle  map[string][]Season
+	names            map[string]string
+	searchRows       *[]searchCopyRow
+
+	idx      int
+	inserted int
+	row      []any
+	err      error
+}
+
+func newTitlesNextCopySource(
+	cfg Config,
+	datasetDate time.Time,
+	tconsts []string,
+	basics map[string]TitleBasics,
+	ratings map[string]Rating,
+	akasByTitle map[string]map[string][]Aka,
+	actorsByTitle map[string][]principalRow,
+	producersByTitle map[string][]principalRow,
+	crewByTitle map[string]crewLists,
+	episodesByTitle map[string][]Season,
+	names map[string]string,
+	searchRows *[]searchCopyRow,
+) *titlesNextCopySource {
+	return &titlesNextCopySource{
+		cfg:              cfg,
+		datasetDate:      datasetDate,
+		tconsts:          tconsts,
+		basics:           basics,
+		ratings:          ratings,
+		akasByTitle:      akasByTitle,
+		actorsByTitle:    actorsByTitle,
+		producersByTitle: producersByTitle,
+		crewByTitle:      crewByTitle,
+		episodesByTitle:  episodesByTitle,
+		names:            names,
+		searchRows:       searchRows,
+		row:              make([]any, 14),
+	}
+}
+
+func (s *titlesNextCopySource) Next() bool {
+	if s.err != nil {
+		return false
+	}
+	for s.idx < len(s.tconsts) {
+		tconst := s.tconsts[s.idx]
+		s.idx++
+
+		basic, ok := s.basics[tconst]
+		if !ok {
+			continue
+		}
+
+		rating := s.ratings[tconst]
+		akas := s.akasByTitle[tconst]
+		if akas == nil {
+			akas = map[string][]Aka{}
+		} else {
+			akas = filterAkas(akas, basic.PrimaryTitle, basic.OriginalTitle)
+			if akas == nil {
+				akas = map[string][]Aka{}
+			}
+		}
+
+		cast := buildCast(s.actorsByTitle[tconst], s.names)
+		if cast == nil {
+			cast = []CastMember{}
+		}
+
+		producers := buildProducers(s.producersByTitle[tconst], s.names)
+		if producers == nil {
+			producers = []Producer{}
+		}
+
+		crewLists := s.crewByTitle[tconst]
+		directors := buildCrewMembers(crewLists.Directors, s.names)
+		writers := buildCrewMembers(crewLists.Writers, s.names)
+		if directors == nil {
+			directors = []CrewMember{}
+		}
+		if writers == nil {
+			writers = []CrewMember{}
+		}
+
+		episodes := s.episodesByTitle[tconst]
+		if episodes == nil {
+			episodes = []Season{}
+		}
+
+		data := TitleData{
+			Basics:  basic,
+			Akas:    akas,
+			Ratings: rating,
+			Cast:    cast,
+			Crew: TitleCrew{
+				Directors: directors,
+				Writers:   writers,
+				Producers: producers,
+			},
+			Episodes: episodes,
+		}
+
+		jsonb, err := toJSONB(data)
+		if err != nil {
+			s.err = fmt.Errorf("jsonb %s: %w", tconst, err)
+			return false
+		}
+
+		s.row[0] = tconst
+		s.row[1] = basic.TitleType
+		s.row[2] = basic.PrimaryTitle
+		s.row[3] = basic.OriginalTitle
+		s.row[4] = intOrNil(basic.StartYear)
+		s.row[5] = intOrNil(basic.EndYear)
+		s.row[6] = basic.IsAdult
+		s.row[7] = intOrNil(basic.RuntimeMinutes)
+		s.row[8] = basic.Genres
+		s.row[9] = floatOrNil(rating.AverageRating)
+		s.row[10] = intOrNil(rating.NumVotes)
+		s.row[11] = jsonb
+		s.row[12] = s.datasetDate
+		s.row[13] = s.cfg.SchemaVersion
+
+		if basic.TitleType != "tvepisode" {
+			akaTitles := make([]string, 0)
+			for _, regionEntries := range akas {
+				for _, aka := range regionEntries {
+					akaTitles = append(akaTitles, aka.Title)
+				}
+			}
+			akaTitles = dedupeStrings(akaTitles)
+			*s.searchRows = append(*s.searchRows, searchCopyRow{
+				Tconst:        tconst,
+				TitleType:     basic.TitleType,
+				StartYear:     basic.StartYear,
+				PrimaryTitle:  basic.PrimaryTitle,
+				OriginalTitle: basic.OriginalTitle,
+				AkaTitles:     akaTitles,
+			})
+		}
+
+		s.inserted++
+		return true
+	}
+	return false
+}
+
+func (s *titlesNextCopySource) Values() ([]any, error) {
+	return s.row, nil
+}
+
+func (s *titlesNextCopySource) Err() error {
+	return s.err
+}
+
+func (s *titlesNextCopySource) Inserted() int {
+	return s.inserted
+}
+
+type searchRowsCopySource struct {
+	rows     []searchCopyRow
+	idx      int
+	inserted int
+	row      []any
+}
+
+func newSearchRowsCopySource(rows []searchCopyRow) *searchRowsCopySource {
+	return &searchRowsCopySource{
+		rows: rows,
+		row:  make([]any, 6),
+	}
+}
+
+func (s *searchRowsCopySource) Next() bool {
+	if s.idx >= len(s.rows) {
+		return false
+	}
+	item := s.rows[s.idx]
+	s.idx++
+
+	s.row[0] = item.Tconst
+	s.row[1] = item.TitleType
+	s.row[2] = intOrNil(item.StartYear)
+	s.row[3] = item.PrimaryTitle
+	s.row[4] = item.OriginalTitle
+	s.row[5] = item.AkaTitles
+
+	s.inserted++
+	return true
+}
+
+func (s *searchRowsCopySource) Values() ([]any, error) {
+	return s.row, nil
+}
+
+func (s *searchRowsCopySource) Err() error {
+	return nil
+}
+
+func (s *searchRowsCopySource) Inserted() int {
+	return s.inserted
 }
 
 func buildTitlesInBatches(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log.Logger) error {
@@ -1510,108 +2276,7 @@ func buildAndInsertBatch(ctx context.Context, conn *pgxpool.Conn, cfg Config, tc
 	}
 	episodesDur := time.Since(stepStart)
 
-	titlesRows := make([][]any, 0, len(tconsts))
-	searchRows := make([][]any, 0, len(tconsts))
-
-	buildStart := time.Now()
-	for _, tconst := range tconsts {
-		basic, ok := basics[tconst]
-		if !ok {
-			continue
-		}
-
-		rating := ratings[tconst]
-
-		akas := akasByTitle[tconst]
-		if akas == nil {
-			akas = map[string][]Aka{}
-		} else {
-			akas = filterAkas(akas, basic.PrimaryTitle, basic.OriginalTitle)
-			if akas == nil {
-				akas = map[string][]Aka{}
-			}
-		}
-
-		cast := buildCast(actorsByTitle[tconst], names)
-		if cast == nil {
-			cast = []CastMember{}
-		}
-
-		producers := buildProducers(producersByTitle[tconst], names)
-		if producers == nil {
-			producers = []Producer{}
-		}
-
-		crewLists := crewByTitle[tconst]
-		directors := buildCrewMembers(crewLists.Directors, names)
-		writers := buildCrewMembers(crewLists.Writers, names)
-		if directors == nil {
-			directors = []CrewMember{}
-		}
-		if writers == nil {
-			writers = []CrewMember{}
-		}
-
-		episodes := episodesByTitle[tconst]
-		if episodes == nil {
-			episodes = []Season{}
-		}
-
-		data := TitleData{
-			Basics:  basic,
-			Akas:    akas,
-			Ratings: rating,
-			Cast:    cast,
-			Crew: TitleCrew{
-				Directors: directors,
-				Writers:   writers,
-				Producers: producers,
-			},
-			Episodes: episodes,
-		}
-
-		jsonb, err := toJSONB(data)
-		if err != nil {
-			return fmt.Errorf("jsonb %s: %w", tconst, err)
-		}
-
-		titlesRows = append(titlesRows, []any{
-			tconst,
-			basic.TitleType,
-			basic.PrimaryTitle,
-			basic.OriginalTitle,
-			intOrNil(basic.StartYear),
-			intOrNil(basic.EndYear),
-			basic.IsAdult,
-			intOrNil(basic.RuntimeMinutes),
-			basic.Genres,
-			floatOrNil(rating.AverageRating),
-			intOrNil(rating.NumVotes),
-			jsonb,
-			datasetDate,
-			cfg.SchemaVersion,
-		})
-
-		if basic.TitleType != "tvepisode" {
-			akaTitles := make([]string, 0)
-			for _, regionEntries := range akas {
-				for _, aka := range regionEntries {
-					akaTitles = append(akaTitles, aka.Title)
-				}
-			}
-			akaTitles = dedupeStrings(akaTitles)
-
-			searchRows = append(searchRows, []any{
-				tconst,
-				basic.TitleType,
-				intOrNil(basic.StartYear),
-				basic.PrimaryTitle,
-				basic.OriginalTitle,
-				akaTitles,
-			})
-		}
-	}
-	buildDur := time.Since(buildStart)
+	searchRows := make([]searchCopyRow, 0, len(tconsts))
 
 	tx, err := conn.Begin(ctx)
 	if err != nil {
@@ -1622,37 +2287,54 @@ func buildAndInsertBatch(ctx context.Context, conn *pgxpool.Conn, cfg Config, tc
 	}()
 
 	var copyTitlesDur time.Duration
-	if len(titlesRows) > 0 {
-		stepStart = time.Now()
-		_, err = tx.CopyFrom(
-			ctx,
-			pgx.Identifier{"titles_next"},
-			[]string{
-				"tconst",
-				"title_type",
-				"primary_title",
-				"original_title",
-				"start_year",
-				"end_year",
-				"is_adult",
-				"runtime_minutes",
-				"genres",
-				"average_rating",
-				"num_votes",
-				"data",
-				"dataset_date",
-				"schema_version",
-			},
-			pgx.CopyFromRows(titlesRows),
-		)
-		if err != nil {
-			return fmt.Errorf("copy titles_next: %w", err)
-		}
-		copyTitlesDur = time.Since(stepStart)
+	titlesSource := newTitlesNextCopySource(
+		cfg,
+		datasetDate,
+		tconsts,
+		basics,
+		ratings,
+		akasByTitle,
+		actorsByTitle,
+		producersByTitle,
+		crewByTitle,
+		episodesByTitle,
+		names,
+		&searchRows,
+	)
+	stepStart = time.Now()
+	_, err = tx.CopyFrom(
+		ctx,
+		pgx.Identifier{"titles_next"},
+		[]string{
+			"tconst",
+			"title_type",
+			"primary_title",
+			"original_title",
+			"start_year",
+			"end_year",
+			"is_adult",
+			"runtime_minutes",
+			"genres",
+			"average_rating",
+			"num_votes",
+			"data",
+			"dataset_date",
+			"schema_version",
+		},
+		titlesSource,
+	)
+	if err != nil {
+		return fmt.Errorf("copy titles_next: %w", err)
 	}
+	if err := titlesSource.Err(); err != nil {
+		return err
+	}
+	copyTitlesDur = time.Since(stepStart)
+	buildDur := copyTitlesDur
 
 	var copySearchDur time.Duration
 	if len(searchRows) > 0 {
+		searchSource := newSearchRowsCopySource(searchRows)
 		stepStart = time.Now()
 		_, err = tx.CopyFrom(
 			ctx,
@@ -1665,7 +2347,7 @@ func buildAndInsertBatch(ctx context.Context, conn *pgxpool.Conn, cfg Config, tc
 				"original_title",
 				"aka_titles",
 			},
-			pgx.CopyFromRows(searchRows),
+			searchSource,
 		)
 		if err != nil {
 			return fmt.Errorf("copy title_search_next: %w", err)
@@ -1679,7 +2361,7 @@ func buildAndInsertBatch(ctx context.Context, conn *pgxpool.Conn, cfg Config, tc
 	}
 	commitDur := time.Since(stepStart)
 
-	logger.Printf("etl: batch inserted titles=%d", len(titlesRows))
+	logger.Printf("etl: batch inserted titles=%d search=%d", titlesSource.Inserted(), len(searchRows))
 	logger.Printf(
 		"etl: batch timings basics=%s ratings=%s akas=%s principals=%s crew=%s names=%s episodes=%s build=%s copy_titles=%s copy_search=%s commit=%s total=%s",
 		basicsDur.Truncate(time.Millisecond),
@@ -1715,10 +2397,10 @@ WHERE tconst = ANY($1)`, tconsts)
 			titleType     string
 			primaryTitle  string
 			originalTitle string
-			isAdult       string
-			startYear     string
-			endYear       string
-			runtime       string
+			isAdult       pgtype.Bool
+			startYear     pgtype.Int4
+			endYear       pgtype.Int4
+			runtime       pgtype.Int4
 			genres        string
 		)
 		if err := rows.Scan(&tconst, &titleType, &primaryTitle, &originalTitle, &isAdult, &startYear, &endYear, &runtime, &genres); err != nil {
@@ -1733,10 +2415,10 @@ WHERE tconst = ANY($1)`, tconsts)
 			TitleType:      titleType,
 			PrimaryTitle:   primaryTitle,
 			OriginalTitle:  originalTitle,
-			IsAdult:        isAdult == "1",
-			StartYear:      parseInt(startYear),
-			EndYear:        parseInt(endYear),
-			RuntimeMinutes: parseInt(runtime),
+			IsAdult:        isAdult.Valid && isAdult.Bool,
+			StartYear:      intPtrFromPg(startYear),
+			EndYear:        intPtrFromPg(endYear),
+			RuntimeMinutes: intPtrFromPg(runtime),
 			Genres:         splitList(genres),
 		}
 	}
@@ -1757,23 +2439,15 @@ WHERE tconst = ANY($1)`, tconsts)
 	for rows.Next() {
 		var (
 			tconst string
-			avg    pgtype.Text
-			votes  pgtype.Text
+			avg    pgtype.Float8
+			votes  pgtype.Int4
 		)
 		if err := rows.Scan(&tconst, &avg, &votes); err != nil {
 			return nil, err
 		}
-		avgStr := ""
-		if avg.Valid {
-			avgStr = avg.String
-		}
-		votesStr := ""
-		if votes.Valid {
-			votesStr = votes.String
-		}
 		out[tconst] = Rating{
-			AverageRating: parseFloat(avgStr),
-			NumVotes:      parseInt(votesStr),
+			AverageRating: floatPtrFromPg(avg),
+			NumVotes:      intPtrFromPg(votes),
 		}
 	}
 	return out, rows.Err()
@@ -1784,7 +2458,7 @@ func fetchAkas(ctx context.Context, q queryer, tconsts []string) (map[string]map
 SELECT titleId, ordering, title, region, language, types, attributes, isOriginalTitle
 FROM stg_title_akas
 WHERE titleId = ANY($1)
-ORDER BY titleId, ordering::INT`, tconsts)
+ORDER BY titleId, ordering`, tconsts)
 	if err != nil {
 		return nil, err
 	}
@@ -1794,15 +2468,15 @@ ORDER BY titleId, ordering::INT`, tconsts)
 	for rows.Next() {
 		var (
 			titleId         string
-			orderingRaw     string
+			ordering        pgtype.Int4
 			title           string
 			region          string
 			language        string
 			types           string
 			attributes      string
-			isOriginalTitle string
+			isOriginalTitle pgtype.Bool
 		)
-		if err := rows.Scan(&titleId, &orderingRaw, &title, &region, &language, &types, &attributes, &isOriginalTitle); err != nil {
+		if err := rows.Scan(&titleId, &ordering, &title, &region, &language, &types, &attributes, &isOriginalTitle); err != nil {
 			return nil, err
 		}
 
@@ -1810,10 +2484,9 @@ ORDER BY titleId, ordering::INT`, tconsts)
 		if region == "" {
 			region = "GLOBAL"
 		}
-
-		ordering := 0
-		if parsed, err := strconv.Atoi(strings.TrimSpace(orderingRaw)); err == nil {
-			ordering = parsed
+		orderVal := 0
+		if ordering.Valid {
+			orderVal = int(ordering.Int32)
 		}
 
 		aka := Aka{
@@ -1821,8 +2494,8 @@ ORDER BY titleId, ordering::INT`, tconsts)
 			Language:        strings.TrimSpace(nullIfNA(language)),
 			Types:           splitList(types),
 			Attributes:      splitList(attributes),
-			IsOriginalTitle: isOriginalTitle == "1",
-			Ordering:        ordering,
+			IsOriginalTitle: isOriginalTitle.Valid && isOriginalTitle.Bool,
+			Ordering:        orderVal,
 		}
 
 		if _, ok := out[titleId]; !ok {
@@ -1873,7 +2546,7 @@ WITH ranked AS (
          CASE WHEN category IN ('actor','actress') THEN 1 ELSE 0 END AS is_actor,
          row_number() OVER (
            PARTITION BY tconst, CASE WHEN category IN ('actor','actress') THEN 1 ELSE 0 END
-           ORDER BY ordering::INT
+           ORDER BY ordering
          ) AS rn
   FROM stg_title_principals
   WHERE tconst = ANY($1)
@@ -1886,7 +2559,7 @@ SELECT tconst, ordering, nconst, category, characters
 FROM ranked
 WHERE (is_actor = 1 AND rn <= $2)
    OR (is_actor = 0 AND rn <= $3)
-ORDER BY tconst, ordering::INT`, tconsts, maxActors, maxProducers)
+ORDER BY tconst, ordering`, tconsts, maxActors, maxProducers)
 	if err != nil {
 		return nil, err
 	}
@@ -1896,7 +2569,7 @@ ORDER BY tconst, ordering::INT`, tconsts, maxActors, maxProducers)
 	for rows.Next() {
 		var (
 			tconst     string
-			ordering   string
+			ordering   pgtype.Int4
 			nconst     string
 			category   string
 			characters string
@@ -1905,8 +2578,8 @@ ORDER BY tconst, ordering::INT`, tconsts, maxActors, maxProducers)
 			return nil, err
 		}
 		ord := 0
-		if parsed, err := strconv.Atoi(ordering); err == nil {
-			ord = parsed
+		if ordering.Valid {
+			ord = int(ordering.Int32)
 		}
 		out = append(out, principalRow{
 			Tconst:     tconst,
@@ -1975,7 +2648,7 @@ func fetchEpisodes(ctx context.Context, q queryer, tconsts []string) (map[string
 
 	rows, err := q.Query(ctx, `
 SELECT parent_tconst, tconst, season_number, episode_number,
-       primary_title, start_year, average_rating::float8, num_votes
+       primary_title, start_year, average_rating, num_votes
 FROM stg_episode_enriched
 WHERE parent_tconst = ANY($1)
 ORDER BY parent_tconst, season_number NULLS LAST, episode_number NULLS LAST, tconst`, tconsts)
@@ -2355,32 +3028,32 @@ func discoverHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 		yearToRaw := strings.TrimSpace(c.QueryParam("year_to"))
 		genre := strings.ToLower(strings.TrimSpace(c.QueryParam("genre")))
 
-		var typeList []string
+		var typeGroup string
 		switch titleType {
 		case "series":
-			typeList = []string{"tvseries", "tvminiseries", "tvspecial"}
+			typeGroup = "series"
 		case "movies":
-			typeList = []string{"movie", "tvmovie"}
+			typeGroup = "movies"
 		default:
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "type must be 'series' or 'movies'"})
 		}
 
-		var yearFrom any
+		var yearFrom *int
 		if yearFromRaw != "" {
 			parsed, err := strconv.Atoi(yearFromRaw)
 			if err != nil {
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid year_from"})
 			}
-			yearFrom = parsed
+			yearFrom = &parsed
 		}
 
-		var yearTo any
+		var yearTo *int
 		if yearToRaw != "" {
 			parsed, err := strconv.Atoi(yearToRaw)
 			if err != nil {
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid year_to"})
 			}
-			yearTo = parsed
+			yearTo = &parsed
 		}
 
 		limit := 20
@@ -2396,17 +3069,38 @@ func discoverHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 			limit = 50
 		}
 
-		ctx := c.Request().Context()
-		rows, err := pool.Query(ctx, `
+		table := "discover_core"
+		args := make([]any, 0, 5)
+		args = append(args, typeGroup)
+		param := 2
+		where := "WHERE type_group = $1"
+		if genre != "" {
+			table = "discover_genre"
+			where += fmt.Sprintf(" AND genre = $%d", param)
+			args = append(args, genre)
+			param++
+		}
+		if yearFrom != nil {
+			where += fmt.Sprintf(" AND start_year >= $%d", param)
+			args = append(args, *yearFrom)
+			param++
+		}
+		if yearTo != nil {
+			where += fmt.Sprintf(" AND start_year <= $%d", param)
+			args = append(args, *yearTo)
+			param++
+		}
+		args = append(args, limit)
+		sql := fmt.Sprintf(`
 SELECT tconst, title_type, primary_title, original_title, start_year, end_year,
        genres, average_rating::float8, num_votes
-FROM discover
-WHERE title_type = ANY($1)
-  AND genre = $2
-  AND ($3::INT IS NULL OR start_year >= $3::INT)
-  AND ($4::INT IS NULL OR start_year <= $4::INT)
+FROM %s
+%s
 ORDER BY num_votes DESC NULLS LAST
-LIMIT $5`, typeList, genre, yearFrom, yearTo, limit)
+LIMIT $%d`, table, where, param)
+
+		ctx := c.Request().Context()
+		rows, err := pool.Query(ctx, sql, args...)
 		if err != nil {
 			return err
 		}

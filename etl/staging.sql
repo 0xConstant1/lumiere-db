@@ -1,34 +1,37 @@
-CREATE UNLOGGED TABLE IF NOT EXISTS stg_title_basics (
+DROP TABLE IF EXISTS stg_title_basics;
+CREATE UNLOGGED TABLE stg_title_basics (
   tconst TEXT,
   titleType TEXT,
   primaryTitle TEXT,
   originalTitle TEXT,
-  isAdult TEXT,
-  startYear TEXT,
-  endYear TEXT,
-  runtimeMinutes TEXT,
+  isAdult BOOLEAN,
+  startYear INT,
+  endYear INT,
+  runtimeMinutes INT,
   genres TEXT
 );
 ALTER TABLE stg_title_basics SET (autovacuum_enabled = false);
 TRUNCATE stg_title_basics;
 
-CREATE UNLOGGED TABLE IF NOT EXISTS stg_title_akas (
+DROP TABLE IF EXISTS stg_title_akas;
+CREATE UNLOGGED TABLE stg_title_akas (
   titleId TEXT,
-  ordering TEXT,
+  ordering INT,
   title TEXT,
   region TEXT,
   language TEXT,
   types TEXT,
   attributes TEXT,
-  isOriginalTitle TEXT
+  isOriginalTitle BOOLEAN
 );
 ALTER TABLE stg_title_akas SET (autovacuum_enabled = false);
 TRUNCATE stg_title_akas;
 
-CREATE UNLOGGED TABLE IF NOT EXISTS stg_title_ratings (
+DROP TABLE IF EXISTS stg_title_ratings;
+CREATE UNLOGGED TABLE stg_title_ratings (
   tconst TEXT,
-  averageRating TEXT,
-  numVotes TEXT
+  averageRating DOUBLE PRECISION,
+  numVotes INT
 );
 ALTER TABLE stg_title_ratings SET (autovacuum_enabled = false);
 TRUNCATE stg_title_ratings;
@@ -36,7 +39,7 @@ TRUNCATE stg_title_ratings;
 DROP TABLE IF EXISTS stg_title_principals;
 CREATE UNLOGGED TABLE stg_title_principals (
   tconst TEXT,
-  ordering TEXT,
+  ordering INT,
   nconst TEXT,
   category TEXT,
   characters TEXT
@@ -44,7 +47,8 @@ CREATE UNLOGGED TABLE stg_title_principals (
 ALTER TABLE stg_title_principals SET (autovacuum_enabled = false);
 TRUNCATE stg_title_principals;
 
-CREATE UNLOGGED TABLE IF NOT EXISTS stg_title_crew (
+DROP TABLE IF EXISTS stg_title_crew;
+CREATE UNLOGGED TABLE stg_title_crew (
   tconst TEXT,
   directors TEXT,
   writers TEXT
@@ -52,11 +56,12 @@ CREATE UNLOGGED TABLE IF NOT EXISTS stg_title_crew (
 ALTER TABLE stg_title_crew SET (autovacuum_enabled = false);
 TRUNCATE stg_title_crew;
 
-CREATE UNLOGGED TABLE IF NOT EXISTS stg_title_episode (
+DROP TABLE IF EXISTS stg_title_episode;
+CREATE UNLOGGED TABLE stg_title_episode (
   tconst TEXT,
   parentTconst TEXT,
-  seasonNumber TEXT,
-  episodeNumber TEXT
+  seasonNumber INT,
+  episodeNumber INT
 );
 ALTER TABLE stg_title_episode SET (autovacuum_enabled = false);
 TRUNCATE stg_title_episode;

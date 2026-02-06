@@ -16,7 +16,7 @@ LumiereDB is an opinionated, self-hostable API built on IMDb's non-commercial da
 docker compose up -d
 ```
 
-2. The API container runs the ETL on startup and begins serving once it completes.
+2. The API container can run ETL in scheduler mode (default), serving requests while periodic ETL checks/rebuilds run in the background.
 
 Default ports:
 - API: `http://localhost:8000`
@@ -50,12 +50,24 @@ IMDb datasets:
 - `IMDB_BASE_URL` (default: `https://datasets.imdbws.com`)
 - `IMDB_DATA_DIR` (default: `/data`)
 - `IMDB_FORCE_DOWNLOAD` (default: `false`)
+- `IMDB_FORCE_REBUILD` (default: `false`)
 - `DATASET_DATE` (default: current UTC date)
+
+Scheduler:
+- `ETL_SCHEDULE_ENABLED` (default: `true`)
+- `ETL_POLL_INTERVAL` (default: `1h`)
+- `ETL_BOOTSTRAP_BLOCKING` (default: `true`)
+- `ETL_SWAP_LOCK_TIMEOUT` (default: `30s`)
+
+Update trigger rule:
+- Scheduler polls IMDb with `HEAD` and compares `Last-Modified` + `Content-Length` per file.
+- A full rebuild runs only when all tracked files changed versus the last successful run.
 
 ETL controls:
 - `ETL_SQL_DIR` (default: `etl` or `../etl`)
 - `ETL_LOAD_BATCH_SIZE` (default: `10000`)
 - `ETL_BATCH_SIZE` (default: `10000`)
+- `ETL_DOWNLOAD_CONCURRENCY` (default: `3`)
 - `ETL_KEEP_STAGING` (default: `false`)
 - `ETL_MIN_NUMVOTES` (default: `1`)
 - `ETL_MAX_ACTORS` (default: `10`)
