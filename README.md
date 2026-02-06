@@ -34,9 +34,16 @@ Search (BM25 via ParadeDB):
 - `GET /search?query=...&type=series&limit=20`
 - `GET /search?query=...&type=movies&limit=20`
 
-Discover (simple filters):
-- `GET /discover?type=series&year_from=2020&year_to=2023&genre=horror&limit=20`
-- `GET /discover?type=movies&year_from=2020&year_to=2023&genre=horror&limit=20`
+Discover:
+- `GET /discover?type=series&year_from=2020&year_to=2023&genres=horror,mystery&sort=popular&limit=20`
+- `GET /discover?type=movies&genres=action,thriller&min_votes=10000&min_rating=7.0&sort=top_rated&limit=20`
+- `GET /discover?type=movies&sort=newest&limit=20&cursor=...`
+
+Discover query notes:
+- `type` is required: `series` or `movies`
+- `genres` (or `genre`) supports up to 3 values; when multiple are passed, all must match
+- `sort`: `popular` (default), `top_rated`, `newest`, `oldest`
+- `cursor` enables keyset pagination; response includes `meta.nextCursor`
 
 **Environment Variables**
 
