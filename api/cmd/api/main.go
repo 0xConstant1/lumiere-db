@@ -2906,15 +2906,6 @@ func floatPtrFromPg(val pgtype.Float8) *float64 {
 	return &v
 }
 
-func parseBoolParam(val string) bool {
-	switch strings.ToLower(strings.TrimSpace(val)) {
-	case "1", "true", "yes", "y":
-		return true
-	default:
-		return false
-	}
-}
-
 func runServer(pool *pgxpool.Pool, cfg Config, logger *log.Logger) error {
 	e := echo.New()
 	e.Use(middleware.Recover())
@@ -2940,18 +2931,16 @@ type SearchItem struct {
 	PrimaryTitle  string   `json:"primaryTitle"`
 	OriginalTitle string   `json:"originalTitle"`
 	AkaTitles     []string `json:"akaTitles"`
-	Score         float64  `json:"score"`
+	Popularity    int      `json:"popularity"`
+	Similarity    float64  `json:"similarity"`
 }
 
 type SearchResponse struct {
 	Items []SearchItem `json:"items"`
-	Meta  SearchMeta   `json:"meta"`
 }
 
 type SearchMeta struct {
 	Limit          int          `json:"limit"`
-	HasMore        bool         `json:"hasMore"`
-	NextCursor     *string      `json:"nextCursor,omitempty"`
 	AppliedFilters SearchFilter `json:"appliedFilters"`
 }
 
@@ -3012,11 +3001,6 @@ type discoverCursor struct {
 	Fingerprint string       `json:"fingerprint"`
 }
 
-type searchCursor struct {
-	Offset      int    `json:"offset"`
-	Fingerprint string `json:"fingerprint"`
-}
-
 func getTitleHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		tconst := c.Param("tconst")
@@ -3044,10 +3028,11 @@ func searchHandler(pool *pgxpool.Pool, enabled bool) echo.HandlerFunc {
 			return c.JSON(http.StatusNotImplemented, map[string]string{"error": "search is disabled"})
 		}
 
-		query := strings.TrimSpace(c.QueryParam("query"))
+		query := normalizeSearchQuery(c.QueryParam("query"))
 		if query == "" {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "query is required"})
 		}
+		queryTokens := strings.Fields(query)
 
 		titleType := strings.ToLower(strings.TrimSpace(c.QueryParam("type")))
 		var typeList []string
@@ -3073,146 +3058,111 @@ func searchHandler(pool *pgxpool.Pool, enabled bool) echo.HandlerFunc {
 			limit = 50
 		}
 
-		fingerprint := searchFilterFingerprint(query, titleType)
-		var cursor *searchCursor
-		offset := 0
-		if raw := strings.TrimSpace(c.QueryParam("cursor")); raw != "" {
-			parsed, err := decodeSearchCursor(raw)
-			if err != nil {
-				return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
-			}
-			if parsed.Fingerprint != fingerprint {
-				return c.JSON(http.StatusBadRequest, map[string]string{"error": "cursor does not match requested filters"})
-			}
-			cursor = &parsed
-			offset = cursor.Offset
-		}
-
-		sqlLimit := limit + 1
-		candidateLimit := offset + sqlLimit + 100
-		if candidateLimit < 120 {
-			candidateLimit = 120
-		}
-		if candidateLimit > 2000 {
-			candidateLimit = 2000
-		}
-		args := []any{query, typeList, sqlLimit, candidateLimit, offset}
-
-		sql := `
-WITH primary_original_candidates AS (
-SELECT tconst, title_type, start_year, primary_title, original_title, aka_titles, COALESCE(popularity, 0) AS popularity,
-       pdb.score(tconst) AS score,
-       CASE
-         WHEN lower(primary_title) = lower($1) OR lower(original_title) = lower($1) THEN 0::int
-         ELSE 1::int
-       END AS match_tier
-FROM title_search
-WHERE title_type = ANY($2)
-  AND (
-    primary_title @@@ pdb.match($1, conjunction_mode => true)::pdb.boost(8)
-    OR original_title @@@ pdb.match($1, conjunction_mode => true)::pdb.boost(6)
-    OR primary_title @@@ pdb.match($1, distance => 1, conjunction_mode => true)::pdb.boost(3)
-    OR original_title @@@ pdb.match($1, distance => 1, conjunction_mode => true)::pdb.boost(2)
-  )
-ORDER BY score DESC, tconst DESC
-LIMIT $4
-), aka_candidates AS (
-SELECT tconst, title_type, start_year, primary_title, original_title, aka_titles, COALESCE(popularity, 0) AS popularity,
-       pdb.score(tconst) AS score,
-       2::int AS match_tier
-FROM title_search
-WHERE title_type = ANY($2)
-  AND (
-    aka_titles @@@ pdb.match($1, conjunction_mode => true)::pdb.boost(0.75)
-    OR aka_titles @@@ pdb.match($1, distance => 1, conjunction_mode => true)::pdb.boost(0.25)
-  )
-ORDER BY score DESC, tconst DESC
-LIMIT $4
-), merged AS (
-SELECT tconst, title_type, start_year, primary_title, original_title, aka_titles, popularity, score, match_tier
-FROM primary_original_candidates
-UNION ALL
-SELECT tconst, title_type, start_year, primary_title, original_title, aka_titles, popularity, score, match_tier
-FROM aka_candidates
-), ranked AS (
-SELECT DISTINCT ON (tconst)
-       tconst, title_type, start_year, primary_title, original_title, aka_titles, popularity, score, match_tier
-FROM merged
-ORDER BY tconst, match_tier ASC, score DESC, popularity DESC
-)
-SELECT tconst, title_type, start_year, primary_title, original_title, aka_titles, score
-FROM ranked
-ORDER BY match_tier ASC, score DESC, popularity DESC, tconst DESC
-LIMIT $3 OFFSET $5`
-
+		enablePhrase := len(queryTokens) > 1
 		ctx := c.Request().Context()
-		rows, err := pool.Query(ctx, sql, args...)
+		sql := buildSearchSQL(enablePhrase)
+		results, err := runSearchQuery(ctx, pool, sql, query, typeList, limit)
 		if err != nil {
 			return err
-		}
-		defer rows.Close()
-
-		results := make([]SearchItem, 0, sqlLimit)
-		for rows.Next() {
-			var (
-				tconst        string
-				resultType    string
-				startYear     pgtype.Int4
-				primaryTitle  string
-				originalTitle string
-				akaTitles     []string
-				score         float64
-			)
-			if err := rows.Scan(&tconst, &resultType, &startYear, &primaryTitle, &originalTitle, &akaTitles, &score); err != nil {
-				return err
-			}
-			if akaTitles == nil {
-				akaTitles = []string{}
-			}
-			results = append(results, SearchItem{
-				Tconst:        tconst,
-				TitleType:     resultType,
-				StartYear:     intPtrFromPg(startYear),
-				PrimaryTitle:  primaryTitle,
-				OriginalTitle: originalTitle,
-				AkaTitles:     akaTitles,
-				Score:         score,
-			})
-		}
-		if err := rows.Err(); err != nil {
-			return err
-		}
-
-		hasMore := len(results) > limit
-		if hasMore {
-			results = results[:limit]
-		}
-
-		var nextCursor *string
-		if hasMore {
-			encoded, err := encodeSearchCursor(searchCursor{
-				Offset:      offset + limit,
-				Fingerprint: fingerprint,
-			})
-			if err != nil {
-				return err
-			}
-			nextCursor = &encoded
 		}
 
 		return c.JSON(http.StatusOK, SearchResponse{
 			Items: results,
-			Meta: SearchMeta{
-				Limit:      limit,
-				HasMore:    hasMore,
-				NextCursor: nextCursor,
-				AppliedFilters: SearchFilter{
-					Query: query,
-					Type:  titleType,
-				},
-			},
 		})
 	}
+}
+
+func buildSearchSQL(enablePhrase bool) string {
+	// Conjunction match - all tokens must be present (any order)
+	clauses := []string{
+		"primary_title @@@ pdb.match($1::text, conjunction_mode => true)::pdb.boost(3.0)",
+		"original_title @@@ pdb.match($1::text, conjunction_mode => true)::pdb.boost(2.0)",
+		"aka_titles @@@ pdb.match($1::text, conjunction_mode => true)::pdb.boost(0.5)",
+	}
+
+	if enablePhrase {
+		// Phrase match with slop=3 - tokens in order, higher boost for accuracy
+		// Use ICU tokenizer to convert query text to token array
+		phraseTokens := "(($1::text)::pdb.icu('stopwords_language=english', 'ascii_folding=true')::text[])"
+		clauses = append(clauses,
+			fmt.Sprintf("CASE WHEN cardinality(%s) > 1 THEN primary_title @@@ pdb.phrase(%s, 3)::pdb.boost(6.0) ELSE FALSE END", phraseTokens, phraseTokens),
+			fmt.Sprintf("CASE WHEN cardinality(%s) > 1 THEN original_title @@@ pdb.phrase(%s, 3)::pdb.boost(4.0) ELSE FALSE END", phraseTokens, phraseTokens),
+		)
+	}
+
+	var sqlBuilder strings.Builder
+	sqlBuilder.WriteString(`
+SELECT
+  tconst,
+  title_type,
+  start_year,
+  primary_title,
+  original_title,
+  aka_titles,
+  popularity,
+  pdb.score(tconst) AS score
+FROM title_search
+WHERE title_type = ANY($2)
+  AND (
+  `)
+	sqlBuilder.WriteString(strings.Join(clauses, "\n      OR "))
+	sqlBuilder.WriteString(`
+  )
+ORDER BY
+  popularity DESC,
+  pdb.score(tconst) DESC,
+  tconst DESC
+LIMIT $3`)
+	return sqlBuilder.String()
+}
+
+func runSearchQuery(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	sql string,
+	query string,
+	typeList []string,
+	limit int,
+) ([]SearchItem, error) {
+	rows, err := pool.Query(ctx, sql, query, typeList, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	results := make([]SearchItem, 0, limit)
+	for rows.Next() {
+		var (
+			tconst        string
+			resultType    string
+			startYear     pgtype.Int4
+			primaryTitle  string
+			originalTitle string
+			akaTitles     []string
+			popularity    int
+			score         float64
+		)
+		if err := rows.Scan(&tconst, &resultType, &startYear, &primaryTitle, &originalTitle, &akaTitles, &popularity, &score); err != nil {
+			return nil, err
+		}
+		if akaTitles == nil {
+			akaTitles = []string{}
+		}
+		results = append(results, SearchItem{
+			Tconst:        tconst,
+			TitleType:     resultType,
+			StartYear:     intPtrFromPg(startYear),
+			PrimaryTitle:  primaryTitle,
+			OriginalTitle: originalTitle,
+			AkaTitles:     akaTitles,
+			Popularity:    popularity,
+			Similarity:    score,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 func parseDiscoverSort(raw string) (discoverSort, error) {
@@ -3279,34 +3229,12 @@ func decodeDiscoverCursor(raw string) (discoverCursor, error) {
 	return cur, nil
 }
 
-func searchFilterFingerprint(query, titleType string) string {
-	return strings.Join([]string{
-		strings.ToLower(strings.TrimSpace(query)),
-		titleType,
-	}, "|")
-}
-
-func encodeSearchCursor(cur searchCursor) (string, error) {
-	data, err := json.Marshal(cur)
-	if err != nil {
-		return "", err
+func normalizeSearchQuery(raw string) string {
+	parts := strings.Fields(strings.TrimSpace(raw))
+	if len(parts) == 0 {
+		return ""
 	}
-	return base64.RawURLEncoding.EncodeToString(data), nil
-}
-
-func decodeSearchCursor(raw string) (searchCursor, error) {
-	var cur searchCursor
-	data, err := base64.RawURLEncoding.DecodeString(raw)
-	if err != nil {
-		return cur, err
-	}
-	if err := json.Unmarshal(data, &cur); err != nil {
-		return cur, err
-	}
-	if cur.Fingerprint == "" || cur.Offset < 1 {
-		return cur, errors.New("invalid cursor payload")
-	}
-	return cur, nil
+	return strings.ToLower(strings.Join(parts, " "))
 }
 
 func discoverFilterFingerprint(

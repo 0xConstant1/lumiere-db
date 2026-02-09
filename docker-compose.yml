@@ -49,7 +49,7 @@ services:
       ETL_DB_WAL_COMPRESSION: "on"
       ETL_DB_MAX_PARALLEL_WORKERS: "8"
       ETL_DB_MAX_PARALLEL_MAINTENANCE_WORKERS: "4"
-      ETL_MIN_NUMVOTES: "5"
+      ETL_MIN_NUMVOTES: "15"
     depends_on:
       db:
         condition: service_healthy
