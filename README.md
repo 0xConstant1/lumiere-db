@@ -30,15 +30,50 @@ Titles:
 - `GET /titles/{tconst}`  
 Returns the full JSON blob for a title.
 
-Search (BM25 via ParadeDB):
+Search (`/search`):
 - `GET /search?query=...&type=series&limit=20`
 - `GET /search?query=...&type=movies&limit=20`
-- `GET /search?query=...&type=movies&limit=20&cursor=...`
 
-Search query notes:
-- `type` is required: `series` or `movies`
-- Uses boosted relevance across title fields with typo tolerance
-- `cursor` enables pagination; response includes `meta.nextCursor`
+Search params:
+- `query` (required)
+- `type` (required): `series` or `movies`
+- `limit` (optional): default `20`, min `1`, max `50`
+
+Search behavior:
+- Uses boosted conjunction matching across `primary_title`, `original_title`, and `aka_titles`.
+- For multi-token queries, also applies boosted phrase matching (`pdb.phrase`).
+- Currently sorts by popularity but still work in progress, needs more refinement.
+- Best for full results pages after the user submits a search.
+
+Search example:
+```bash
+curl "http://localhost:8000/search?query=dark%20knight&type=movies&limit=20"
+```
+
+Autocomplete (`/search/suggest`):
+- `GET /search/suggest?query=...&type=series&limit=10`
+- `GET /search/suggest?query=...&type=movies&limit=10`
+
+Autocomplete params:
+- `query` (required): minimum `2` characters, maximum `80`
+- `type` (required): `movies` or `series`
+- `limit` (optional): default `10`, min `1`, max `15`
+
+Autocomplete behavior:
+- Strict prefix-first suggestions for title completion.
+- Currently excludes `aka_titles`.
+- Designed for low-latency search-bar typeahead.
+
+Autocomplete example:
+```bash
+curl "http://localhost:8000/search/suggest?query=night&type=movies&limit=10"
+```
+
+Client integration recommendations:
+- Trigger calls only when input length is `>= 2`
+- Debounce requests (around `120-250ms`)
+- Cancel in-flight requests when the user types again
+- Use `type` consistently with the active tab/filter in your UI
 
 Discover:
 - `GET /discover?type=series&year_from=2020&year_to=2023&genres=horror,mystery&sort=popular&limit=20`
