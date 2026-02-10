@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -2911,6 +2912,11 @@ func runServer(pool *pgxpool.Pool, cfg Config, logger *log.Logger) error {
 	e := echo.New()
 	e.Use(middleware.Recover())
 	e.Use(middleware.RequestLogger())
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins: []string{"*"},
+		AllowMethods: []string{http.MethodGet, http.MethodOptions},
+		AllowHeaders: []string{"Origin", "Content-Type", "Accept"},
+	}))
 
 	e.GET("/health", func(c *echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
@@ -2918,6 +2924,7 @@ func runServer(pool *pgxpool.Pool, cfg Config, logger *log.Logger) error {
 
 	e.GET("/titles/:tconst", getTitleHandler(pool))
 	e.GET("/search", searchHandler(pool, cfg.EnablePGSearch))
+	e.GET("/search/suggest", suggestHandler(pool, cfg.EnablePGSearch))
 	e.GET("/discover", discoverapi.NewHandler(pool))
 
 	addr := ":" + cfg.Port
@@ -2938,6 +2945,20 @@ type SearchItem struct {
 
 type SearchResponse struct {
 	Items []SearchItem `json:"items"`
+}
+
+type SuggestItem struct {
+	Tconst        string  `json:"tconst"`
+	TitleType     string  `json:"titleType"`
+	StartYear     *int    `json:"startYear"`
+	PrimaryTitle  string  `json:"primaryTitle"`
+	OriginalTitle string  `json:"originalTitle"`
+	Popularity    int     `json:"popularity"`
+	Similarity    float64 `json:"similarity"`
+}
+
+type SuggestResponse struct {
+	Items []SuggestItem `json:"items"`
 }
 
 type SearchMeta struct {
@@ -3021,6 +3042,65 @@ func searchHandler(pool *pgxpool.Pool, enabled bool) echo.HandlerFunc {
 	}
 }
 
+func suggestHandler(pool *pgxpool.Pool, enabled bool) echo.HandlerFunc {
+	return func(c *echo.Context) error {
+		if !enabled {
+			return c.JSON(http.StatusNotImplemented, map[string]string{"error": "search is disabled"})
+		}
+
+		query := normalizeSearchQuery(c.QueryParam("query"))
+		if query == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "query is required"})
+		}
+		if len(query) < 2 {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "query must have at least 2 characters"})
+		}
+		if len(query) > 80 {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "query must have at most 80 characters"})
+		}
+
+		titleType := strings.ToLower(strings.TrimSpace(c.QueryParam("type")))
+		var typeList []string
+		switch titleType {
+		case "series":
+			typeList = []string{"tvseries", "tvminiseries", "tvspecial"}
+		case "movies":
+			typeList = []string{"movie", "tvmovie"}
+		default:
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "type must be 'series' or 'movies'"})
+		}
+
+		limit := 10
+		if raw := c.QueryParam("limit"); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil {
+				limit = parsed
+			}
+		}
+		if limit < 1 {
+			limit = 1
+		}
+		if limit > 15 {
+			limit = 15
+		}
+
+		enablePhrasePrefix := len(strings.Fields(query)) > 1
+		regexPattern := buildSuggestPrefixPattern(query)
+		sql := buildSuggestSQL(enablePhrasePrefix)
+
+		ctx, cancel := context.WithTimeout(c.Request().Context(), 120*time.Millisecond)
+		defer cancel()
+
+		results, err := runSuggestQuery(ctx, pool, sql, query, typeList, regexPattern, limit)
+		if err != nil {
+			return err
+		}
+
+		return c.JSON(http.StatusOK, SuggestResponse{
+			Items: results,
+		})
+	}
+}
+
 func buildSearchSQL(enablePhrase bool) string {
 	// Conjunction match - all tokens must be present (any order)
 	clauses := []string{
@@ -3052,6 +3132,7 @@ SELECT
   pdb.score(tconst) AS score
 FROM title_search
 WHERE title_type = ANY($2)
+  AND $1::text <> ''
   AND (
   `)
 	sqlBuilder.WriteString(strings.Join(clauses, "\n      OR "))
@@ -3112,6 +3193,96 @@ func runSearchQuery(
 		return nil, err
 	}
 	return results, nil
+}
+
+func buildSuggestSQL(enablePhrasePrefix bool) string {
+	clauses := []string{
+		"primary_title::pdb.alias('primary_title_exact') @@@ pdb.regex($3::text)::pdb.boost(12.0)",
+		"original_title::pdb.alias('original_title_exact') @@@ pdb.regex($3::text)::pdb.boost(8.0)",
+	}
+
+	if enablePhrasePrefix {
+		phraseTokens := "(($1::text)::pdb.icu('stopwords_language=english', 'ascii_folding=true')::text[])"
+		clauses = append(clauses,
+			fmt.Sprintf("CASE WHEN cardinality(%s) > 1 THEN primary_title @@@ pdb.phrase_prefix(%s, 32)::pdb.boost(5.0) ELSE FALSE END", phraseTokens, phraseTokens),
+			fmt.Sprintf("CASE WHEN cardinality(%s) > 1 THEN original_title @@@ pdb.phrase_prefix(%s, 24)::pdb.boost(3.0) ELSE FALSE END", phraseTokens, phraseTokens),
+		)
+	}
+
+	var sqlBuilder strings.Builder
+	sqlBuilder.WriteString(`
+SELECT
+  tconst,
+  title_type,
+  start_year,
+  primary_title,
+  original_title,
+  popularity,
+  pdb.score(tconst) AS score
+FROM title_search
+WHERE title_type = ANY($2)
+  AND $1::text <> ''
+  AND (
+  `)
+	sqlBuilder.WriteString(strings.Join(clauses, "\n      OR "))
+	sqlBuilder.WriteString(`
+  )
+ORDER BY
+  pdb.score(tconst) DESC,
+  popularity DESC,
+  tconst DESC
+LIMIT $4`)
+	return sqlBuilder.String()
+}
+
+func runSuggestQuery(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	sql string,
+	query string,
+	typeList []string,
+	regexPattern string,
+	limit int,
+) ([]SuggestItem, error) {
+	rows, err := pool.Query(ctx, sql, query, typeList, regexPattern, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	results := make([]SuggestItem, 0, limit)
+	for rows.Next() {
+		var (
+			tconst        string
+			resultType    string
+			startYear     pgtype.Int4
+			primaryTitle  string
+			originalTitle string
+			popularity    int
+			score         float64
+		)
+		if err := rows.Scan(&tconst, &resultType, &startYear, &primaryTitle, &originalTitle, &popularity, &score); err != nil {
+			return nil, err
+		}
+
+		results = append(results, SuggestItem{
+			Tconst:        tconst,
+			TitleType:     resultType,
+			StartYear:     intPtrFromPg(startYear),
+			PrimaryTitle:  primaryTitle,
+			OriginalTitle: originalTitle,
+			Popularity:    popularity,
+			Similarity:    score,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func buildSuggestPrefixPattern(query string) string {
+	return regexp.QuoteMeta(query) + ".*"
 }
 
 func normalizeSearchQuery(raw string) string {
