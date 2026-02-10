@@ -164,6 +164,14 @@ func NewHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 		args = append(args, typeGroup)
 		param := 2
 		where := "WHERE d.type_group = $1"
+		switch sortMode {
+		case discoverSortTopRated:
+			where += " AND d.average_rating IS NOT NULL AND d.num_votes IS NOT NULL"
+		case discoverSortNewest, discoverSortOldest:
+			where += " AND d.start_year IS NOT NULL AND d.num_votes IS NOT NULL"
+		default:
+			where += " AND d.num_votes IS NOT NULL"
+		}
 
 		if yearFrom != nil {
 			where += fmt.Sprintf(" AND d.start_year >= $%d", param)
@@ -176,12 +184,12 @@ func NewHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 			param++
 		}
 		if minVotes != nil {
-			where += fmt.Sprintf(" AND COALESCE(d.num_votes, 0) >= $%d", param)
+			where += fmt.Sprintf(" AND d.num_votes >= $%d", param)
 			args = append(args, *minVotes)
 			param++
 		}
 		if minRating != nil {
-			where += fmt.Sprintf(" AND COALESCE(d.average_rating, 0)::float8 >= $%d", param)
+			where += fmt.Sprintf(" AND d.average_rating >= $%d::numeric", param)
 			args = append(args, *minRating)
 			param++
 		}
@@ -203,28 +211,28 @@ func NewHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 				if cursor.RatingKey == nil || cursor.VotesKey == nil {
 					return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
 				}
-				where += fmt.Sprintf(" AND (COALESCE(d.average_rating, -1)::float8, COALESCE(d.num_votes, -1), d.tconst) < ($%d, $%d, $%d)", param, param+1, param+2)
+				where += fmt.Sprintf(" AND (d.average_rating, d.num_votes, d.tconst) < ($%d::numeric, $%d, $%d)", param, param+1, param+2)
 				args = append(args, *cursor.RatingKey, *cursor.VotesKey, cursor.Tconst)
 				param += 3
 			case discoverSortNewest:
 				if cursor.YearKey == nil || cursor.VotesKey == nil {
 					return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
 				}
-				where += fmt.Sprintf(" AND (COALESCE(d.start_year, -1), COALESCE(d.num_votes, -1), d.tconst) < ($%d, $%d, $%d)", param, param+1, param+2)
+				where += fmt.Sprintf(" AND (d.start_year, d.num_votes, d.tconst) < ($%d, $%d, $%d)", param, param+1, param+2)
 				args = append(args, *cursor.YearKey, *cursor.VotesKey, cursor.Tconst)
 				param += 3
 			case discoverSortOldest:
 				if cursor.YearKey == nil || cursor.VotesKey == nil {
 					return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
 				}
-				where += fmt.Sprintf(" AND (COALESCE(d.start_year, 2147483647) > $%d OR (COALESCE(d.start_year, 2147483647) = $%d AND (COALESCE(d.num_votes, -1) < $%d OR (COALESCE(d.num_votes, -1) = $%d AND d.tconst < $%d))))", param, param, param+1, param+1, param+2)
+				where += fmt.Sprintf(" AND (d.start_year > $%d OR (d.start_year = $%d AND (d.num_votes, d.tconst) < ($%d, $%d)))", param, param, param+1, param+2)
 				args = append(args, *cursor.YearKey, *cursor.VotesKey, cursor.Tconst)
 				param += 3
 			default:
 				if cursor.VotesKey == nil {
 					return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
 				}
-				where += fmt.Sprintf(" AND (COALESCE(d.num_votes, -1), d.tconst) < ($%d, $%d)", param, param+1)
+				where += fmt.Sprintf(" AND (d.num_votes, d.tconst) < ($%d, $%d)", param, param+1)
 				args = append(args, *cursor.VotesKey, cursor.Tconst)
 				param += 2
 			}
@@ -235,11 +243,7 @@ func NewHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 		orderClause := discoverOrderClause(sortMode)
 		sql := fmt.Sprintf(`
 SELECT d.tconst, d.title_type, d.primary_title, d.original_title, d.start_year, d.end_year,
-       d.genres, d.average_rating::float8, d.num_votes,
-       COALESCE(d.start_year, -1) AS sort_year_desc,
-       COALESCE(d.start_year, 2147483647) AS sort_year_asc,
-       COALESCE(d.num_votes, -1) AS sort_votes,
-       COALESCE(d.average_rating, -1)::float8 AS sort_rating
+       d.genres, d.average_rating::float8, d.num_votes
 FROM discover_core d
 %s
 ORDER BY %s
@@ -265,10 +269,6 @@ LIMIT $%d`, where, orderClause, param)
 				genresArr     []string
 				avgRating     pgtype.Float8
 				numVotes      pgtype.Int4
-				sortYearDesc  int32
-				sortYearAsc   int32
-				sortVotes     int32
-				sortRating    float64
 			)
 			if err := rows.Scan(
 				&tconst,
@@ -280,10 +280,6 @@ LIMIT $%d`, where, orderClause, param)
 				&genresArr,
 				&avgRating,
 				&numVotes,
-				&sortYearDesc,
-				&sortYearAsc,
-				&sortVotes,
-				&sortRating,
 			); err != nil {
 				return err
 			}
@@ -308,18 +304,26 @@ LIMIT $%d`, where, orderClause, param)
 				Tconst:      tconst,
 				Fingerprint: fingerprint,
 			}
-			voteKey := int(sortVotes)
-			cur.VotesKey = &voteKey
+			cur.VotesKey = intPtrFromPg(numVotes)
+			if cur.VotesKey == nil {
+				return errors.New("discover cursor invariant: missing votes key")
+			}
 			switch sortMode {
 			case discoverSortTopRated:
-				ratingKey := sortRating
-				cur.RatingKey = &ratingKey
+				cur.RatingKey = floatPtrFromPg(avgRating)
+				if cur.RatingKey == nil {
+					return errors.New("discover cursor invariant: missing rating key")
+				}
 			case discoverSortNewest:
-				yearKey := int(sortYearDesc)
-				cur.YearKey = &yearKey
+				cur.YearKey = intPtrFromPg(startYear)
+				if cur.YearKey == nil {
+					return errors.New("discover cursor invariant: missing year key")
+				}
 			case discoverSortOldest:
-				yearKey := int(sortYearAsc)
-				cur.YearKey = &yearKey
+				cur.YearKey = intPtrFromPg(startYear)
+				if cur.YearKey == nil {
+					return errors.New("discover cursor invariant: missing year key")
+				}
 			}
 			rowCursors = append(rowCursors, cur)
 		}
@@ -467,13 +471,13 @@ func discoverFilterFingerprint(
 func discoverOrderClause(sortMode discoverSort) string {
 	switch sortMode {
 	case discoverSortTopRated:
-		return "COALESCE(d.average_rating, -1)::float8 DESC, COALESCE(d.num_votes, -1) DESC, d.tconst DESC"
+		return "d.average_rating DESC NULLS LAST, d.num_votes DESC NULLS LAST, d.tconst DESC"
 	case discoverSortNewest:
-		return "COALESCE(d.start_year, -1) DESC, COALESCE(d.num_votes, -1) DESC, d.tconst DESC"
+		return "d.start_year DESC NULLS LAST, d.num_votes DESC NULLS LAST, d.tconst DESC"
 	case discoverSortOldest:
-		return "COALESCE(d.start_year, 2147483647) ASC, COALESCE(d.num_votes, -1) DESC, d.tconst DESC"
+		return "d.start_year ASC NULLS LAST, d.num_votes DESC NULLS LAST, d.tconst DESC"
 	default:
-		return "COALESCE(d.num_votes, -1) DESC, d.tconst DESC"
+		return "d.num_votes DESC NULLS LAST, d.tconst DESC"
 	}
 }
 
