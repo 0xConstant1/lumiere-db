@@ -35,7 +35,7 @@ services:
       ETL_SCHEDULE_ENABLED: "true"
       ETL_POLL_INTERVAL: "1h"
       ETL_BOOTSTRAP_BLOCKING: "true"
-      ETL_KEEP_STAGING: "true"
+      ETL_KEEP_STAGING: "false"
       ETL_LOAD_BATCH_SIZE: "20000"
       ETL_BATCH_SIZE: "20000"
       ETL_DOWNLOAD_CONCURRENCY: "3"
