@@ -163,44 +163,45 @@ func NewHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 		args := make([]any, 0, 16)
 		args = append(args, typeGroup)
 		param := 2
-		where := "WHERE d.type_group = $1"
+		var where strings.Builder
+		where.WriteString("WHERE d.type_group = $1")
 		switch sortMode {
 		case discoverSortTopRated:
-			where += " AND d.average_rating IS NOT NULL AND d.num_votes IS NOT NULL"
+			where.WriteString(" AND d.average_rating IS NOT NULL AND d.num_votes IS NOT NULL")
 		case discoverSortNewest, discoverSortOldest:
-			where += " AND d.start_year IS NOT NULL AND d.num_votes IS NOT NULL"
+			where.WriteString(" AND d.start_year IS NOT NULL AND d.num_votes IS NOT NULL")
 		default:
-			where += " AND d.num_votes IS NOT NULL"
+			where.WriteString(" AND d.num_votes IS NOT NULL")
 		}
 
 		if yearFrom != nil {
-			where += fmt.Sprintf(" AND d.start_year >= $%d", param)
+			where.WriteString(fmt.Sprintf(" AND d.start_year >= $%d", param))
 			args = append(args, *yearFrom)
 			param++
 		}
 		if yearTo != nil {
-			where += fmt.Sprintf(" AND d.start_year <= $%d", param)
+			where.WriteString(fmt.Sprintf(" AND d.start_year <= $%d", param))
 			args = append(args, *yearTo)
 			param++
 		}
 		if minVotes != nil {
-			where += fmt.Sprintf(" AND d.num_votes >= $%d", param)
+			where.WriteString(fmt.Sprintf(" AND d.num_votes >= $%d", param))
 			args = append(args, *minVotes)
 			param++
 		}
 		if minRating != nil {
-			where += fmt.Sprintf(" AND d.average_rating >= $%d::numeric", param)
+			where.WriteString(fmt.Sprintf(" AND d.average_rating >= $%d::numeric", param))
 			args = append(args, *minRating)
 			param++
 		}
 		for _, genre := range genres {
-			where += fmt.Sprintf(` AND EXISTS (
+			where.WriteString(fmt.Sprintf(` AND EXISTS (
     SELECT 1
     FROM discover_genre dg
     WHERE dg.type_group = d.type_group
       AND dg.tconst = d.tconst
       AND dg.genre = $%d
-)`, param)
+)`, param))
 			args = append(args, genre)
 			param++
 		}
@@ -211,28 +212,28 @@ func NewHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 				if cursor.RatingKey == nil || cursor.VotesKey == nil {
 					return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
 				}
-				where += fmt.Sprintf(" AND (d.average_rating, d.num_votes, d.tconst) < ($%d::numeric, $%d, $%d)", param, param+1, param+2)
+				where.WriteString(fmt.Sprintf(" AND (d.average_rating, d.num_votes, d.tconst) < ($%d::numeric, $%d, $%d)", param, param+1, param+2))
 				args = append(args, *cursor.RatingKey, *cursor.VotesKey, cursor.Tconst)
 				param += 3
 			case discoverSortNewest:
 				if cursor.YearKey == nil || cursor.VotesKey == nil {
 					return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
 				}
-				where += fmt.Sprintf(" AND (d.start_year, d.num_votes, d.tconst) < ($%d, $%d, $%d)", param, param+1, param+2)
+				where.WriteString(fmt.Sprintf(" AND (d.start_year, d.num_votes, d.tconst) < ($%d, $%d, $%d)", param, param+1, param+2))
 				args = append(args, *cursor.YearKey, *cursor.VotesKey, cursor.Tconst)
 				param += 3
 			case discoverSortOldest:
 				if cursor.YearKey == nil || cursor.VotesKey == nil {
 					return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
 				}
-				where += fmt.Sprintf(" AND (d.start_year > $%d OR (d.start_year = $%d AND (d.num_votes, d.tconst) < ($%d, $%d)))", param, param, param+1, param+2)
+				where.WriteString(fmt.Sprintf(" AND (d.start_year > $%d OR (d.start_year = $%d AND (d.num_votes, d.tconst) < ($%d, $%d)))", param, param, param+1, param+2))
 				args = append(args, *cursor.YearKey, *cursor.VotesKey, cursor.Tconst)
 				param += 3
 			default:
 				if cursor.VotesKey == nil {
 					return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
 				}
-				where += fmt.Sprintf(" AND (d.num_votes, d.tconst) < ($%d, $%d)", param, param+1)
+				where.WriteString(fmt.Sprintf(" AND (d.num_votes, d.tconst) < ($%d, $%d)", param, param+1))
 				args = append(args, *cursor.VotesKey, cursor.Tconst)
 				param += 2
 			}
@@ -247,7 +248,7 @@ SELECT d.tconst, d.title_type, d.primary_title, d.original_title, d.start_year, 
 FROM discover_core d
 %s
 ORDER BY %s
-LIMIT $%d`, where, orderClause, param)
+LIMIT $%d`, where.String(), orderClause, param)
 
 		ctx := c.Request().Context()
 		rows, err := pool.Query(ctx, sql, args...)
@@ -390,7 +391,7 @@ func parseDiscoverGenres(c *echo.Context) ([]string, error) {
 	seen := map[string]struct{}{}
 	genres := make([]string, 0, 3)
 	for _, raw := range rawValues {
-		for _, part := range strings.Split(raw, ",") {
+		for part := range strings.SplitSeq(raw, ",") {
 			g := strings.ToLower(strings.TrimSpace(part))
 			if g == "" {
 				continue
