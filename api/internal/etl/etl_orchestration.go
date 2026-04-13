@@ -32,7 +32,13 @@ var imdbDatasetFiles = []string{
 	"name.basics.tsv.gz",
 }
 
-const etlSchedulerLockKey int64 = 573901235911
+const (
+	etlSchedulerLockKey        int64         = 573901235911
+	sourceStateTable                         = "etl_source_state"
+	pendingStateTable                        = "etl_pending_source_state"
+	manifestStabilityDelay     time.Duration = 30 * time.Second
+	manifestStabilityMaxChecks               = 10
+)
 
 func runETL(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log.Logger) error {
 	logger.Printf("etl: starting")
@@ -49,16 +55,6 @@ func runETL(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log.Log
 	if err := downloadDatasets(ctx, cfg, logger); err != nil {
 		return err
 	}
-
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		return fmt.Errorf("acquire conn: %w", err)
-	}
-	if err := applySystemSettings(ctx, conn, cfg, logger); err != nil {
-		conn.Release()
-		return err
-	}
-	conn.Release()
 
 	if err := runSQLFile(ctx, pool, cfg, logger, "schema.sql"); err != nil {
 		return err
@@ -195,50 +191,6 @@ SELECT current_setting('work_mem'),
 	return nil
 }
 
-func applySystemSettings(ctx context.Context, conn *pgxpool.Conn, cfg Config, logger *log.Logger) error {
-	setting := func(name string, value string) error {
-		if value == "" {
-			return nil
-		}
-		if strings.Contains(value, "'") || strings.Contains(value, ";") {
-			return fmt.Errorf("%s contains invalid character", name)
-		}
-		_, err := conn.Exec(ctx, fmt.Sprintf("ALTER SYSTEM SET %s = '%s'", name, value))
-		if err != nil {
-			return fmt.Errorf("alter system %s: %w", name, err)
-		}
-		return nil
-	}
-
-	if err := setting("max_wal_size", cfg.DBMaxWalSize); err != nil {
-		return err
-	}
-	if err := setting("min_wal_size", cfg.DBMinWalSize); err != nil {
-		return err
-	}
-	if err := setting("checkpoint_timeout", cfg.DBCheckpointTimeout); err != nil {
-		return err
-	}
-	if err := setting("checkpoint_completion_target", cfg.DBCheckpointCompletionTarget); err != nil {
-		return err
-	}
-	if err := setting("wal_compression", cfg.DBWalCompression); err != nil {
-		return err
-	}
-	if err := setting("max_parallel_workers", cfg.DBMaxParallelWorkers); err != nil {
-		return err
-	}
-	if err := setting("max_parallel_maintenance_workers", cfg.DBMaxParallelMaintenanceWorkers); err != nil {
-		return err
-	}
-
-	if _, err := conn.Exec(ctx, "SELECT pg_reload_conf()"); err != nil {
-		return fmt.Errorf("reload conf: %w", err)
-	}
-	logger.Printf("etl: applied postgres settings via ALTER SYSTEM")
-	return nil
-}
-
 func startETLScheduler(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log.Logger) {
 	logger.Printf("etl: scheduler enabled poll_interval=%s", cfg.PollInterval)
 	go func() {
@@ -263,27 +215,55 @@ func startETLScheduler(ctx context.Context, pool *pgxpool.Pool, cfg Config, logg
 }
 
 func runScheduledRebuildCycle(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log.Logger) error {
+	if err := ensureSchedulerStateTables(ctx, pool); err != nil {
+		return fmt.Errorf("ensure scheduler state tables: %w", err)
+	}
+
 	manifest, err := probeIMDbFileStates(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("probe imdb headers: %w", err)
+	}
+
+	hasTitles, err := hasAnyTitles(ctx, pool)
+	if err != nil {
+		return fmt.Errorf("check titles: %w", err)
+	}
+
+	if cfg.ForceRebuild {
+		logger.Printf("etl: force rebuild enabled (IMDB_FORCE_REBUILD=true)")
+		return rebuildFromManifest(ctx, pool, cfg, logger, manifest)
+	}
+
+	if !hasTitles {
+		stableManifest, err := waitForStableManifest(ctx, cfg, logger, manifest)
+		if err != nil {
+			return err
+		}
+		return rebuildFromManifest(ctx, pool, cfg, logger, stableManifest)
 	}
 
 	prevState, err := loadSourceState(ctx, pool)
 	if err != nil {
 		return fmt.Errorf("load etl source state: %w", err)
 	}
-
-	if cfg.ForceRebuild {
-		logger.Printf("etl: force rebuild enabled (IMDB_FORCE_REBUILD=true)")
-	}
-	if !cfg.ForceRebuild {
-		changedCount, allUpdated := compareStateSets(prevState, manifest)
-		if len(prevState) == 0 {
-			logger.Printf("etl: no previous source state; full rebuild required")
-		} else if !allUpdated {
-			logger.Printf("etl: skip rebuild changed_files=%d/%d (requires all files changed)", changedCount, len(imdbDatasetFiles))
-			return nil
+	if manifestsEqual(prevState, manifest) {
+		if err := clearPendingSourceState(ctx, pool); err != nil {
+			return fmt.Errorf("clear pending source state: %w", err)
 		}
+		logger.Printf("etl: no upstream manifest change detected")
+		return nil
+	}
+
+	pendingState, err := loadPendingSourceState(ctx, pool)
+	if err != nil {
+		return fmt.Errorf("load pending source state: %w", err)
+	}
+	if !manifestsEqual(pendingState, manifest) {
+		if err := savePendingSourceState(ctx, pool, manifest); err != nil {
+			return fmt.Errorf("save pending source state: %w", err)
+		}
+		logger.Printf("etl: manifest change detected; waiting for the next poll to confirm stability")
+		return nil
 	}
 
 	lockConn, locked, err := acquireETLSchedulerLock(ctx, pool)
@@ -296,32 +276,31 @@ func runScheduledRebuildCycle(ctx context.Context, pool *pgxpool.Pool, cfg Confi
 	}
 	defer releaseETLSchedulerLock(lockConn)
 
-	if !cfg.ForceRebuild {
-		prevState, err = loadSourceState(ctx, pool)
-		if err != nil {
-			return fmt.Errorf("reload etl source state: %w", err)
+	latestManifest, err := probeIMDbFileStates(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("re-probe imdb headers: %w", err)
+	}
+	if !manifestsEqual(manifest, latestManifest) {
+		if err := savePendingSourceState(ctx, pool, latestManifest); err != nil {
+			return fmt.Errorf("update pending source state: %w", err)
 		}
-		changedCount, allUpdated := compareStateSets(prevState, manifest)
-		if len(prevState) > 0 && !allUpdated {
-			logger.Printf("etl: skip rebuild after lock changed_files=%d/%d", changedCount, len(imdbDatasetFiles))
-			return nil
+		logger.Printf("etl: manifest changed again while waiting on the lock; waiting for another stable poll")
+		return nil
+	}
+
+	prevState, err = loadSourceState(ctx, pool)
+	if err != nil {
+		return fmt.Errorf("reload etl source state: %w", err)
+	}
+	if manifestsEqual(prevState, latestManifest) {
+		if err := clearPendingSourceState(ctx, pool); err != nil {
+			return fmt.Errorf("clear pending source state: %w", err)
 		}
+		logger.Printf("etl: manifest already processed by another instance")
+		return nil
 	}
 
-	rebuildCfg := cfg
-	rebuildCfg.DatasetDate = datasetDateFromState(manifest)
-	rebuildCfg.ForceDownload = true
-
-	logger.Printf("etl: scheduled rebuild triggered dataset_date=%s", rebuildCfg.DatasetDate)
-	if err := runETL(ctx, pool, rebuildCfg, logger); err != nil {
-		return err
-	}
-
-	if err := saveSourceState(ctx, pool, manifest); err != nil {
-		return fmt.Errorf("persist source state: %w", err)
-	}
-	logger.Printf("etl: scheduled rebuild completed")
-	return nil
+	return rebuildFromManifestLocked(ctx, pool, cfg, logger, latestManifest)
 }
 
 func shouldRunBlockingBootstrap(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
@@ -410,23 +389,24 @@ func probeIMDbFileStates(ctx context.Context, cfg Config) (map[string]imdbFileSt
 	return state, nil
 }
 
-func compareStateSets(previous map[string]imdbFileState, current map[string]imdbFileState) (int, bool) {
-	if len(previous) == 0 || len(current) == 0 {
-		return 0, false
+func manifestsEqual(left map[string]imdbFileState, right map[string]imdbFileState) bool {
+	if len(left) != len(right) {
+		return false
 	}
-	changedCount := 0
 	for _, file := range imdbDatasetFiles {
-		prev, okPrev := previous[file]
-		curr, okCurr := current[file]
-		if !okPrev || !okCurr {
-			return changedCount, false
+		leftEntry, okLeft := left[file]
+		rightEntry, okRight := right[file]
+		if !okLeft || !okRight {
+			return false
 		}
-		if prev.LastModified.Equal(curr.LastModified) && prev.ContentLength == curr.ContentLength {
-			continue
+		if !leftEntry.LastModified.Equal(rightEntry.LastModified) {
+			return false
 		}
-		changedCount++
+		if leftEntry.ContentLength != rightEntry.ContentLength {
+			return false
+		}
 	}
-	return changedCount, changedCount == len(imdbDatasetFiles)
+	return true
 }
 
 func datasetDateFromState(state map[string]imdbFileState) string {
@@ -449,8 +429,107 @@ func datasetDateFromState(state map[string]imdbFileState) string {
 	return maxTime.UTC().Format("2006-01-02")
 }
 
+func ensureSchedulerStateTables(ctx context.Context, pool *pgxpool.Pool) error {
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS etl_source_state (
+  file_name TEXT PRIMARY KEY,
+  last_modified TIMESTAMPTZ NOT NULL,
+  content_length BIGINT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)`,
+		`CREATE TABLE IF NOT EXISTS etl_pending_source_state (
+  file_name TEXT PRIMARY KEY,
+  last_modified TIMESTAMPTZ NOT NULL,
+  content_length BIGINT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)`,
+	}
+	for _, stmt := range statements {
+		if _, err := pool.Exec(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func waitForStableManifest(ctx context.Context, cfg Config, logger *log.Logger, manifest map[string]imdbFileState) (map[string]imdbFileState, error) {
+	current := manifest
+	for attempt := 1; attempt <= manifestStabilityMaxChecks; attempt++ {
+		logger.Printf(
+			"etl: bootstrap manifest observed; waiting %s for stability check (%d/%d)",
+			manifestStabilityDelay,
+			attempt,
+			manifestStabilityMaxChecks,
+		)
+
+		timer := time.NewTimer(manifestStabilityDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("wait for stable imdb manifest: %w", ctx.Err())
+		case <-timer.C:
+		}
+
+		nextManifest, err := probeIMDbFileStates(ctx, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("re-probe imdb headers: %w", err)
+		}
+		if manifestsEqual(current, nextManifest) {
+			logger.Printf("etl: imdb manifest is stable")
+			return nextManifest, nil
+		}
+
+		logger.Printf("etl: imdb manifest still changing; delaying bootstrap rebuild")
+		current = nextManifest
+	}
+
+	return nil, errors.New("imdb manifest did not stabilize before rebuild")
+}
+
+func rebuildFromManifest(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log.Logger, manifest map[string]imdbFileState) error {
+	lockConn, locked, err := acquireETLSchedulerLock(ctx, pool)
+	if err != nil {
+		return fmt.Errorf("acquire etl lock: %w", err)
+	}
+	if !locked {
+		logger.Printf("etl: skip rebuild (lock held by another instance)")
+		return nil
+	}
+	defer releaseETLSchedulerLock(lockConn)
+
+	return rebuildFromManifestLocked(ctx, pool, cfg, logger, manifest)
+}
+
+func rebuildFromManifestLocked(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log.Logger, manifest map[string]imdbFileState) error {
+	rebuildCfg := cfg
+	rebuildCfg.DatasetDate = datasetDateFromState(manifest)
+	rebuildCfg.ForceDownload = true
+
+	logger.Printf("etl: scheduled rebuild triggered dataset_date=%s", rebuildCfg.DatasetDate)
+	if err := runETL(ctx, pool, rebuildCfg, logger); err != nil {
+		return err
+	}
+
+	if err := saveSourceState(ctx, pool, manifest); err != nil {
+		return fmt.Errorf("persist source state: %w", err)
+	}
+	if err := clearPendingSourceState(ctx, pool); err != nil {
+		return fmt.Errorf("clear pending source state: %w", err)
+	}
+	logger.Printf("etl: scheduled rebuild completed")
+	return nil
+}
+
 func loadSourceState(ctx context.Context, pool *pgxpool.Pool) (map[string]imdbFileState, error) {
-	exists, err := tableExists(ctx, pool, "public.etl_source_state")
+	return loadManifestState(ctx, pool, sourceStateTable)
+}
+
+func loadPendingSourceState(ctx context.Context, pool *pgxpool.Pool) (map[string]imdbFileState, error) {
+	return loadManifestState(ctx, pool, pendingStateTable)
+}
+
+func loadManifestState(ctx context.Context, pool *pgxpool.Pool, tableName string) (map[string]imdbFileState, error) {
+	exists, err := tableExists(ctx, pool, "public."+tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -458,9 +537,9 @@ func loadSourceState(ctx context.Context, pool *pgxpool.Pool) (map[string]imdbFi
 		return map[string]imdbFileState{}, nil
 	}
 
-	rows, err := pool.Query(ctx, `
+	rows, err := pool.Query(ctx, fmt.Sprintf(`
 SELECT file_name, last_modified, content_length
-FROM etl_source_state`)
+FROM %s`, tableName))
 	if err != nil {
 		return nil, err
 	}
@@ -486,6 +565,14 @@ FROM etl_source_state`)
 }
 
 func saveSourceState(ctx context.Context, pool *pgxpool.Pool, state map[string]imdbFileState) error {
+	return saveManifestState(ctx, pool, sourceStateTable, state)
+}
+
+func savePendingSourceState(ctx context.Context, pool *pgxpool.Pool, state map[string]imdbFileState) error {
+	return saveManifestState(ctx, pool, pendingStateTable, state)
+}
+
+func saveManifestState(ctx context.Context, pool *pgxpool.Pool, tableName string, state map[string]imdbFileState) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -499,13 +586,13 @@ func saveSourceState(ctx context.Context, pool *pgxpool.Pool, state map[string]i
 		if !ok {
 			return fmt.Errorf("missing source state for %s", file)
 		}
-		if _, err := tx.Exec(ctx, `
-INSERT INTO etl_source_state (file_name, last_modified, content_length, updated_at)
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`
+INSERT INTO %s (file_name, last_modified, content_length, updated_at)
 VALUES ($1, $2, $3, now())
 ON CONFLICT (file_name) DO UPDATE
 SET last_modified = EXCLUDED.last_modified,
     content_length = EXCLUDED.content_length,
-    updated_at = now()`,
+    updated_at = now()`, tableName),
 			entry.FileName,
 			entry.LastModified,
 			entry.ContentLength,
@@ -514,11 +601,23 @@ SET last_modified = EXCLUDED.last_modified,
 		}
 	}
 
-	if _, err := tx.Exec(ctx, `DELETE FROM etl_source_state WHERE NOT (file_name = ANY($1))`, imdbDatasetFiles); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE NOT (file_name = ANY($1))`, tableName), imdbDatasetFiles); err != nil {
 		return err
 	}
 
 	return tx.Commit(ctx)
+}
+
+func clearPendingSourceState(ctx context.Context, pool *pgxpool.Pool) error {
+	exists, err := tableExists(ctx, pool, "public."+pendingStateTable)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	_, err = pool.Exec(ctx, `DELETE FROM etl_pending_source_state`)
+	return err
 }
 
 func acquireETLSchedulerLock(ctx context.Context, pool *pgxpool.Pool) (*pgxpool.Conn, bool, error) {

@@ -91,13 +91,6 @@ func Load() (etlcore.Config, error) {
 		return cfg, err
 	}
 	cfg.MinNumVotes = clampNonNegative(minNumVotes)
-	cfg.DBMaxWalSize = strings.TrimSpace(os.Getenv("ETL_DB_MAX_WAL_SIZE"))
-	cfg.DBMinWalSize = strings.TrimSpace(os.Getenv("ETL_DB_MIN_WAL_SIZE"))
-	cfg.DBCheckpointTimeout = strings.TrimSpace(os.Getenv("ETL_DB_CHECKPOINT_TIMEOUT"))
-	cfg.DBCheckpointCompletionTarget = strings.TrimSpace(os.Getenv("ETL_DB_CHECKPOINT_COMPLETION_TARGET"))
-	cfg.DBWalCompression = strings.TrimSpace(os.Getenv("ETL_DB_WAL_COMPRESSION"))
-	cfg.DBMaxParallelWorkers = strings.TrimSpace(os.Getenv("ETL_DB_MAX_PARALLEL_WORKERS"))
-	cfg.DBMaxParallelMaintenanceWorkers = strings.TrimSpace(os.Getenv("ETL_DB_MAX_PARALLEL_MAINTENANCE_WORKERS"))
 	cfg.ScheduleEnabled, err = envBool("ETL_SCHEDULE_ENABLED", true)
 	if err != nil {
 		return cfg, err

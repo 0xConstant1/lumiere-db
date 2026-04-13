@@ -13,6 +13,8 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v5"
+
+	"lumiere-api/internal/http/apiutil"
 )
 
 type Item struct {
@@ -69,34 +71,28 @@ type discoverCursor struct {
 
 func NewHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 	return func(c *echo.Context) error {
-		titleType := strings.ToLower(strings.TrimSpace(c.QueryParam("type")))
+		typeGroup, err := apiutil.ParseTypeGroup(c.QueryParam("type"))
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		}
+
 		yearFromRaw := strings.TrimSpace(c.QueryParam("year_from"))
 		yearToRaw := strings.TrimSpace(c.QueryParam("year_to"))
 		sortMode, err := parseDiscoverSort(c.QueryParam("sort"))
 		if err != nil {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "sort must be one of: popular, top_rated, newest, oldest"})
-		}
-
-		var typeGroup string
-		switch titleType {
-		case "series":
-			typeGroup = "series"
-		case "movies":
-			typeGroup = "movies"
-		default:
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "type must be 'series' or 'movies'"})
+			return echo.NewHTTPError(http.StatusBadRequest, "sort must be one of: popular, top_rated, newest, oldest")
 		}
 
 		genres, err := parseDiscoverGenres(c)
 		if err != nil {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
 		var yearFrom *int
 		if yearFromRaw != "" {
 			parsed, err := strconv.Atoi(yearFromRaw)
 			if err != nil {
-				return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid year_from"})
+				return echo.NewHTTPError(http.StatusBadRequest, "invalid year_from")
 			}
 			yearFrom = &parsed
 		}
@@ -105,19 +101,19 @@ func NewHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 		if yearToRaw != "" {
 			parsed, err := strconv.Atoi(yearToRaw)
 			if err != nil {
-				return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid year_to"})
+				return echo.NewHTTPError(http.StatusBadRequest, "invalid year_to")
 			}
 			yearTo = &parsed
 		}
 		if yearFrom != nil && yearTo != nil && *yearFrom > *yearTo {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "year_from must be <= year_to"})
+			return echo.NewHTTPError(http.StatusBadRequest, "year_from must be <= year_to")
 		}
 
 		var minVotes *int
 		if raw := strings.TrimSpace(c.QueryParam("min_votes")); raw != "" {
 			parsed, err := strconv.Atoi(raw)
 			if err != nil || parsed < 0 {
-				return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid min_votes"})
+				return echo.NewHTTPError(http.StatusBadRequest, "invalid min_votes")
 			}
 			minVotes = &parsed
 		}
@@ -126,22 +122,14 @@ func NewHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 		if raw := strings.TrimSpace(c.QueryParam("min_rating")); raw != "" {
 			parsed, err := strconv.ParseFloat(raw, 64)
 			if err != nil || parsed < 0 || parsed > 10 {
-				return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid min_rating"})
+				return echo.NewHTTPError(http.StatusBadRequest, "invalid min_rating")
 			}
 			minRating = &parsed
 		}
 
-		limit := 20
-		if raw := c.QueryParam("limit"); raw != "" {
-			if parsed, err := strconv.Atoi(raw); err == nil {
-				limit = parsed
-			}
-		}
-		if limit < 1 {
-			limit = 1
-		}
-		if limit > 50 {
-			limit = 50
+		limit, err := apiutil.ParseClampedLimit(c.QueryParam("limit"), 20, 1, 50)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
 		fingerprint := discoverFilterFingerprint(sortMode, typeGroup, genres, yearFrom, yearTo, minVotes, minRating)
@@ -149,13 +137,13 @@ func NewHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 		if raw := strings.TrimSpace(c.QueryParam("cursor")); raw != "" {
 			parsed, err := decodeDiscoverCursor(raw)
 			if err != nil {
-				return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
+				return echo.NewHTTPError(http.StatusBadRequest, "invalid cursor")
 			}
 			if parsed.Sort != sortMode {
-				return c.JSON(http.StatusBadRequest, map[string]string{"error": "cursor sort does not match requested sort"})
+				return echo.NewHTTPError(http.StatusBadRequest, "cursor sort does not match requested sort")
 			}
 			if parsed.Fingerprint != fingerprint {
-				return c.JSON(http.StatusBadRequest, map[string]string{"error": "cursor does not match requested filters"})
+				return echo.NewHTTPError(http.StatusBadRequest, "cursor does not match requested filters")
 			}
 			cursor = &parsed
 		}
@@ -210,28 +198,28 @@ func NewHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 			switch sortMode {
 			case discoverSortTopRated:
 				if cursor.RatingKey == nil || cursor.VotesKey == nil {
-					return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
+					return echo.NewHTTPError(http.StatusBadRequest, "invalid cursor")
 				}
 				where.WriteString(fmt.Sprintf(" AND (d.average_rating, d.num_votes, d.tconst) < ($%d::numeric, $%d, $%d)", param, param+1, param+2))
 				args = append(args, *cursor.RatingKey, *cursor.VotesKey, cursor.Tconst)
 				param += 3
 			case discoverSortNewest:
 				if cursor.YearKey == nil || cursor.VotesKey == nil {
-					return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
+					return echo.NewHTTPError(http.StatusBadRequest, "invalid cursor")
 				}
 				where.WriteString(fmt.Sprintf(" AND (d.start_year, d.num_votes, d.tconst) < ($%d, $%d, $%d)", param, param+1, param+2))
 				args = append(args, *cursor.YearKey, *cursor.VotesKey, cursor.Tconst)
 				param += 3
 			case discoverSortOldest:
 				if cursor.YearKey == nil || cursor.VotesKey == nil {
-					return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
+					return echo.NewHTTPError(http.StatusBadRequest, "invalid cursor")
 				}
 				where.WriteString(fmt.Sprintf(" AND (d.start_year > $%d OR (d.start_year = $%d AND (d.num_votes, d.tconst) < ($%d, $%d)))", param, param, param+1, param+2))
 				args = append(args, *cursor.YearKey, *cursor.VotesKey, cursor.Tconst)
 				param += 3
 			default:
 				if cursor.VotesKey == nil {
-					return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
+					return echo.NewHTTPError(http.StatusBadRequest, "invalid cursor")
 				}
 				where.WriteString(fmt.Sprintf(" AND (d.num_votes, d.tconst) < ($%d, $%d)", param, param+1))
 				args = append(args, *cursor.VotesKey, cursor.Tconst)
@@ -355,7 +343,7 @@ LIMIT $%d`, where.String(), orderClause, param)
 				HasMore:    hasMore,
 				NextCursor: nextCursor,
 				AppliedFilters: Filter{
-					Type:      titleType,
+					Type:      typeGroup,
 					Genres:    genres,
 					YearFrom:  yearFrom,
 					YearTo:    yearTo,

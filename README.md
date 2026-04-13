@@ -35,7 +35,7 @@ Search (`/search`):
 - `GET /search?query=...&type=movies&limit=20`
 
 Search params:
-- `query` (required)
+- `query` (required): maximum `120` characters
 - `type` (required): `series` or `movies`
 - `limit` (optional): default `20`, min `1`, max `50`
 
@@ -109,7 +109,8 @@ Scheduler:
 
 Update trigger rule:
 - Scheduler polls IMDb with `HEAD` and compares `Last-Modified` + `Content-Length` per file.
-- A full rebuild runs only when all tracked files changed versus the last successful run.
+- A changed manifest is recorded as pending first, and a full rebuild starts only after the same manifest repeats on the next poll.
+- Bootstrap rebuilds also wait for the manifest to stabilize before publishing data.
 
 ETL controls:
 - `ETL_SQL_DIR` (default: `etl` or `../etl`)
@@ -127,13 +128,8 @@ Postgres tuning (optional):
 - `ETL_MAX_PARALLEL_WORKERS`
 - `ETL_WORK_MEM`
 - `ETL_MAINTENANCE_WORK_MEM`
-- `ETL_DB_MAX_WAL_SIZE`
-- `ETL_DB_MIN_WAL_SIZE`
-- `ETL_DB_CHECKPOINT_TIMEOUT`
-- `ETL_DB_CHECKPOINT_COMPLETION_TARGET`
-- `ETL_DB_WAL_COMPRESSION`
-- `ETL_DB_MAX_PARALLEL_WORKERS`
-- `ETL_DB_MAX_PARALLEL_MAINTENANCE_WORKERS`
+
+Cluster-wide Postgres tuning should be configured on the database container itself, for example via the `db.command` entries in [`docker-compose.yml`](./docker-compose.yml), not from API environment variables.
 
 **Limitations**
 - Search and discover are currently very simple and need a lot of polishing.

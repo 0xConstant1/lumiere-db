@@ -2,16 +2,18 @@ package search
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v5"
+
+	"lumiere-api/internal/http/apiutil"
 )
 
 type SearchItem struct {
@@ -43,48 +45,47 @@ type SuggestResponse struct {
 	Items []SuggestItem `json:"items"`
 }
 
+const (
+	searchTimeout         = 4 * time.Second
+	suggestTimeout        = 120 * time.Millisecond
+	maxSearchQueryLength  = 120
+	maxSuggestQueryLength = 80
+)
+
 func NewSearchHandler(pool *pgxpool.Pool, enabled bool) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		if !enabled {
-			return c.JSON(http.StatusNotImplemented, map[string]string{"error": "search is disabled"})
+			return echo.NewHTTPError(http.StatusNotImplemented, "search is disabled")
 		}
 
 		query := normalizeSearchQuery(c.QueryParam("query"))
 		if query == "" {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "query is required"})
+			return echo.NewHTTPError(http.StatusBadRequest, "query is required")
+		}
+		if len(query) > maxSearchQueryLength {
+			return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("query must have at most %d characters", maxSearchQueryLength))
 		}
 		queryTokens := strings.Fields(query)
 
-		titleType := strings.ToLower(strings.TrimSpace(c.QueryParam("type")))
-		var typeList []string
-		switch titleType {
-		case "series":
-			typeList = []string{"tvseries", "tvminiseries", "tvspecial"}
-		case "movies":
-			typeList = []string{"movie", "tvmovie"}
-		default:
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "type must be 'series' or 'movies'"})
+		typeGroup, err := apiutil.ParseTypeGroup(c.QueryParam("type"))
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
+		typeList := typeListForGroup(typeGroup)
 
-		limit := 20
-		if raw := c.QueryParam("limit"); raw != "" {
-			if parsed, err := strconv.Atoi(raw); err == nil {
-				limit = parsed
-			}
-		}
-		if limit < 1 {
-			limit = 1
-		}
-		if limit > 50 {
-			limit = 50
+		limit, err := apiutil.ParseClampedLimit(c.QueryParam("limit"), 20, 1, 50)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
 		enablePhrase := len(queryTokens) > 1
-		ctx := c.Request().Context()
+		ctx, cancel := context.WithTimeout(c.Request().Context(), searchTimeout)
+		defer cancel()
+
 		sql := buildSearchSQL(enablePhrase)
 		results, err := runSearchQuery(ctx, pool, sql, query, typeList, limit)
 		if err != nil {
-			return err
+			return searchQueryError(err, "search timed out")
 		}
 
 		return c.JSON(http.StatusOK, SearchResponse{
@@ -96,54 +97,41 @@ func NewSearchHandler(pool *pgxpool.Pool, enabled bool) echo.HandlerFunc {
 func NewSuggestHandler(pool *pgxpool.Pool, enabled bool) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		if !enabled {
-			return c.JSON(http.StatusNotImplemented, map[string]string{"error": "search is disabled"})
+			return echo.NewHTTPError(http.StatusNotImplemented, "search is disabled")
 		}
 
 		query := normalizeSearchQuery(c.QueryParam("query"))
 		if query == "" {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "query is required"})
+			return echo.NewHTTPError(http.StatusBadRequest, "query is required")
 		}
 		if len(query) < 2 {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "query must have at least 2 characters"})
+			return echo.NewHTTPError(http.StatusBadRequest, "query must have at least 2 characters")
 		}
-		if len(query) > 80 {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "query must have at most 80 characters"})
-		}
-
-		titleType := strings.ToLower(strings.TrimSpace(c.QueryParam("type")))
-		var typeList []string
-		switch titleType {
-		case "series":
-			typeList = []string{"tvseries", "tvminiseries", "tvspecial"}
-		case "movies":
-			typeList = []string{"movie", "tvmovie"}
-		default:
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "type must be 'series' or 'movies'"})
+		if len(query) > maxSuggestQueryLength {
+			return echo.NewHTTPError(http.StatusBadRequest, fmt.Sprintf("query must have at most %d characters", maxSuggestQueryLength))
 		}
 
-		limit := 10
-		if raw := c.QueryParam("limit"); raw != "" {
-			if parsed, err := strconv.Atoi(raw); err == nil {
-				limit = parsed
-			}
+		typeGroup, err := apiutil.ParseTypeGroup(c.QueryParam("type"))
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
-		if limit < 1 {
-			limit = 1
-		}
-		if limit > 15 {
-			limit = 15
+		typeList := typeListForGroup(typeGroup)
+
+		limit, err := apiutil.ParseClampedLimit(c.QueryParam("limit"), 10, 1, 15)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
 		enablePhrasePrefix := len(strings.Fields(query)) > 1
 		regexPattern := buildSuggestPrefixPattern(query)
 		sql := buildSuggestSQL(enablePhrasePrefix)
 
-		ctx, cancel := context.WithTimeout(c.Request().Context(), 120*time.Millisecond)
+		ctx, cancel := context.WithTimeout(c.Request().Context(), suggestTimeout)
 		defer cancel()
 
 		results, err := runSuggestQuery(ctx, pool, sql, query, typeList, regexPattern, limit)
 		if err != nil {
-			return err
+			return searchQueryError(err, "search suggestion timed out")
 		}
 
 		return c.JSON(http.StatusOK, SuggestResponse{
@@ -342,6 +330,24 @@ func runSuggestQuery(
 
 func buildSuggestPrefixPattern(query string) string {
 	return regexp.QuoteMeta(query) + ".*"
+}
+
+func typeListForGroup(typeGroup string) []string {
+	switch typeGroup {
+	case apiutil.TypeGroupSeries:
+		return []string{"tvseries", "tvminiseries", "tvspecial"}
+	case apiutil.TypeGroupMovies:
+		return []string{"movie", "tvmovie"}
+	default:
+		return nil
+	}
+}
+
+func searchQueryError(err error, timeoutMessage string) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return echo.NewHTTPError(http.StatusGatewayTimeout, timeoutMessage)
+	}
+	return err
 }
 
 func normalizeSearchQuery(raw string) string {

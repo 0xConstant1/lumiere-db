@@ -4,6 +4,22 @@ services:
     container_name: lumiere_postgres
     restart: always
     shm_size: "4gb"
+    command:
+      - postgres
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - min_wal_size=1GB
+      - -c
+      - checkpoint_timeout=30min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_compression=on
+      - -c
+      - max_parallel_workers=8
+      - -c
+      - max_parallel_maintenance_workers=4
     environment:
       POSTGRES_USER: user
       POSTGRES_PASSWORD: password
@@ -42,13 +58,6 @@ services:
       ETL_MAX_PARALLEL_WORKERS: "6"
       ETL_WORK_MEM: "64MB"
       ETL_MAINTENANCE_WORK_MEM: "1GB"
-      ETL_DB_MAX_WAL_SIZE: "4GB"
-      ETL_DB_MIN_WAL_SIZE: "1GB"
-      ETL_DB_CHECKPOINT_TIMEOUT: "30min"
-      ETL_DB_CHECKPOINT_COMPLETION_TARGET: "0.9"
-      ETL_DB_WAL_COMPRESSION: "on"
-      ETL_DB_MAX_PARALLEL_WORKERS: "8"
-      ETL_DB_MAX_PARALLEL_MAINTENANCE_WORKERS: "4"
       ETL_MIN_NUMVOTES: "15"
     depends_on:
       db:

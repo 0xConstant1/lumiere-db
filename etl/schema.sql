@@ -59,3 +59,10 @@ CREATE TABLE IF NOT EXISTS etl_source_state (
   content_length BIGINT NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS etl_pending_source_state (
+  file_name TEXT PRIMARY KEY,
+  last_modified TIMESTAMPTZ NOT NULL,
+  content_length BIGINT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

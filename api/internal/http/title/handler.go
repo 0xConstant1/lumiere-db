@@ -13,7 +13,7 @@ func NewHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		tconst := c.Param("tconst")
 		if tconst == "" {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "missing tconst"})
+			return echo.NewHTTPError(http.StatusBadRequest, "missing tconst")
 		}
 
 		ctx := c.Request().Context()
@@ -21,7 +21,7 @@ func NewHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 		err := pool.QueryRow(ctx, `SELECT data FROM titles WHERE tconst = $1`, tconst).Scan(&data)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return c.NoContent(http.StatusNotFound)
+				return echo.NewHTTPError(http.StatusNotFound, "title not found")
 			}
 			return err
 		}
