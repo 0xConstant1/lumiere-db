@@ -31,23 +31,24 @@ func main() {
 	}
 	defer pool.Close()
 
-	if cfg.RunETL {
-		if cfg.ScheduleEnabled {
+	etlCfg := cfg.ETL.Core()
+	if cfg.ETL.Enabled {
+		if cfg.ETL.ScheduleEnabled {
 			needsBootstrap, err := etlcore.ShouldRunBlockingBootstrap(ctx, pool)
 			if err != nil {
 				logger.Fatalf("etl bootstrap check failed: %v", err)
 			}
-			if needsBootstrap && cfg.BootstrapBlocking {
+			if needsBootstrap && cfg.ETL.BootstrapBlocking {
 				logger.Printf("etl: bootstrap run started (titles table is empty)")
-				if err := etlcore.RunScheduledRebuildCycle(ctx, pool, cfg, logger); err != nil {
+				if err := etlcore.RunScheduledRebuildCycle(ctx, pool, etlCfg, logger); err != nil {
 					logger.Fatalf("etl bootstrap failed: %v", err)
 				}
 			} else if needsBootstrap {
 				logger.Printf("etl: bootstrap run deferred to scheduler (ETL_BOOTSTRAP_BLOCKING=false)")
 			}
-			etlcore.StartScheduler(ctx, pool, cfg, logger)
+			etlcore.StartScheduler(ctx, pool, etlCfg, logger)
 		} else {
-			if err := etlcore.Run(ctx, pool, cfg, logger); err != nil {
+			if err := etlcore.Run(ctx, pool, etlCfg, logger); err != nil {
 				logger.Fatalf("etl failed: %v", err)
 			}
 		}

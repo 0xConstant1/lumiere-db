@@ -7,23 +7,21 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	etlcore "lumiere-api/internal/etl"
 )
 
-func Load() (etlcore.Config, error) {
-	cfg := etlcore.Config{}
+func Load() (Config, error) {
+	cfg := Config{}
 	cfg.DatabaseURL = envString("DATABASE_URL", "")
 	if cfg.DatabaseURL == "" {
 		return cfg, errors.New("DATABASE_URL is required")
 	}
 
-	cfg.BaseURL = envString("IMDB_BASE_URL", "https://datasets.imdbws.com")
-	cfg.DataDir = envString("IMDB_DATA_DIR", "/data")
-	cfg.DatasetDate = envString("DATASET_DATE", time.Now().UTC().Format("2006-01-02"))
+	cfg.ETL.BaseURL = envString("IMDB_BASE_URL", "https://datasets.imdbws.com")
+	cfg.ETL.DataDir = envString("IMDB_DATA_DIR", "/data")
+	cfg.ETL.DatasetDate = envString("DATASET_DATE", time.Now().UTC().Format("2006-01-02"))
 	var err error
 
-	cfg.SchemaVersion, err = envInt("SCHEMA_VERSION", 1)
+	cfg.ETL.SchemaVersion, err = envInt("SCHEMA_VERSION", 1)
 	if err != nil {
 		return cfg, err
 	}
@@ -31,15 +29,16 @@ func Load() (etlcore.Config, error) {
 	if err != nil {
 		return cfg, err
 	}
-	cfg.RunETL, err = envBool("RUN_ETL", true)
+	cfg.ETL.EnablePGSearch = cfg.EnablePGSearch
+	cfg.ETL.Enabled, err = envBool("RUN_ETL", true)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ForceDownload, err = envBool("IMDB_FORCE_DOWNLOAD", false)
+	cfg.ETL.ForceDownload, err = envBool("IMDB_FORCE_DOWNLOAD", false)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.KeepStaging, err = envBool("ETL_KEEP_STAGING", false)
+	cfg.ETL.KeepStaging, err = envBool("ETL_KEEP_STAGING", false)
 	if err != nil {
 		return cfg, err
 	}
@@ -47,71 +46,71 @@ func Load() (etlcore.Config, error) {
 	if err != nil {
 		return cfg, err
 	}
-	cfg.LoadBatchSize = clampPositive(loadBatchSize, 10000)
+	cfg.ETL.LoadBatchSize = clampPositive(loadBatchSize, 10000)
 	batchSize, err := envInt("ETL_BATCH_SIZE", 10000)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.BatchSize = clampPositive(batchSize, 10000)
+	cfg.ETL.BatchSize = clampPositive(batchSize, 10000)
 	maxActors, err := envInt("ETL_MAX_ACTORS", 10)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.MaxActors = clampNonNegative(maxActors)
+	cfg.ETL.MaxActors = clampNonNegative(maxActors)
 	maxProducers, err := envInt("ETL_MAX_PRODUCERS", 1)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.MaxProducers = clampNonNegative(maxProducers)
+	cfg.ETL.MaxProducers = clampNonNegative(maxProducers)
 	maxWriters, err := envInt("ETL_MAX_WRITERS", 1)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.MaxWriters = clampNonNegative(maxWriters)
+	cfg.ETL.MaxWriters = clampNonNegative(maxWriters)
 	maxDirectors, err := envInt("ETL_MAX_DIRECTORS", 1)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.MaxDirectors = clampNonNegative(maxDirectors)
-	cfg.MaxParallelWorkers = strings.TrimSpace(os.Getenv("ETL_MAX_PARALLEL_WORKERS"))
-	cfg.WorkMem = strings.TrimSpace(os.Getenv("ETL_WORK_MEM"))
-	cfg.MaintenanceWorkMem = strings.TrimSpace(os.Getenv("ETL_MAINTENANCE_WORK_MEM"))
+	cfg.ETL.MaxDirectors = clampNonNegative(maxDirectors)
+	cfg.ETL.MaxParallelWorkers = strings.TrimSpace(os.Getenv("ETL_MAX_PARALLEL_WORKERS"))
+	cfg.ETL.WorkMem = strings.TrimSpace(os.Getenv("ETL_WORK_MEM"))
+	cfg.ETL.MaintenanceWorkMem = strings.TrimSpace(os.Getenv("ETL_MAINTENANCE_WORK_MEM"))
 	readerBufferSize, err := envInt("ETL_READER_BUFFER", 256*1024)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ReaderBufferSize = clampPositive(readerBufferSize, 256*1024)
+	cfg.ETL.ReaderBufferSize = clampPositive(readerBufferSize, 256*1024)
 	downloadConcurrency, err := envInt("ETL_DOWNLOAD_CONCURRENCY", 3)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.DownloadConcurrency = clampPositive(downloadConcurrency, 3)
+	cfg.ETL.DownloadConcurrency = clampPositive(downloadConcurrency, 3)
 	minNumVotes, err := envInt("ETL_MIN_NUMVOTES", 1)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.MinNumVotes = clampNonNegative(minNumVotes)
-	cfg.ScheduleEnabled, err = envBool("ETL_SCHEDULE_ENABLED", true)
+	cfg.ETL.MinNumVotes = clampNonNegative(minNumVotes)
+	cfg.ETL.ScheduleEnabled, err = envBool("ETL_SCHEDULE_ENABLED", true)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.PollInterval, err = envDuration("ETL_POLL_INTERVAL", time.Hour)
+	cfg.ETL.PollInterval, err = envDuration("ETL_POLL_INTERVAL", time.Hour)
 	if err != nil {
 		return cfg, err
 	}
-	if cfg.PollInterval <= 0 {
+	if cfg.ETL.PollInterval <= 0 {
 		return cfg, errors.New("ETL_POLL_INTERVAL must be greater than 0")
 	}
-	cfg.BootstrapBlocking, err = envBool("ETL_BOOTSTRAP_BLOCKING", true)
+	cfg.ETL.BootstrapBlocking, err = envBool("ETL_BOOTSTRAP_BLOCKING", true)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ForceRebuild, err = envBool("IMDB_FORCE_REBUILD", false)
+	cfg.ETL.ForceRebuild, err = envBool("IMDB_FORCE_REBUILD", false)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.SwapLockTimeout = envString("ETL_SWAP_LOCK_TIMEOUT", "30s")
-	if strings.Contains(cfg.SwapLockTimeout, "'") || strings.Contains(cfg.SwapLockTimeout, ";") {
+	cfg.ETL.SwapLockTimeout = envString("ETL_SWAP_LOCK_TIMEOUT", "30s")
+	if strings.Contains(cfg.ETL.SwapLockTimeout, "'") || strings.Contains(cfg.ETL.SwapLockTimeout, ";") {
 		return cfg, errors.New("ETL_SWAP_LOCK_TIMEOUT contains invalid character")
 	}
 	cfg.Port = envString("PORT", "8000")
@@ -135,7 +134,7 @@ func Load() (etlcore.Config, error) {
 	if err != nil {
 		return cfg, err
 	}
-	cfg.SQLDir = sqlDir
+	cfg.ETL.SQLDir = sqlDir
 
 	return cfg, nil
 }

@@ -3,14 +3,12 @@ package etl
 import "time"
 
 type Config struct {
-	DatabaseURL         string
 	BaseURL             string
 	DataDir             string
 	SQLDir              string
 	DatasetDate         string
 	SchemaVersion       int
 	EnablePGSearch      bool
-	RunETL              bool
 	ForceDownload       bool
 	KeepStaging         bool
 	LoadBatchSize       int
@@ -22,14 +20,10 @@ type Config struct {
 	MaxParallelWorkers  string
 	WorkMem             string
 	MaintenanceWorkMem  string
-	Port                string
-	CORSAllowOrigins    []string
 	ReaderBufferSize    int
 	DownloadConcurrency int
 	MinNumVotes         int
-	ScheduleEnabled     bool
 	PollInterval        time.Duration
-	BootstrapBlocking   bool
 	ForceRebuild        bool
 	SwapLockTimeout     string
 }
