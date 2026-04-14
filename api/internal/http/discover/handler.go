@@ -1,83 +1,28 @@
 package discover
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/jackc/pgx/v5/pgtype"
+	discovercore "lumiere-api/internal/discover"
+	"lumiere-api/internal/http/apiutil"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v5"
-
-	"lumiere-api/internal/http/apiutil"
 )
-
-type Item struct {
-	Tconst        string   `json:"tconst"`
-	TitleType     string   `json:"titleType"`
-	PrimaryTitle  string   `json:"primaryTitle"`
-	OriginalTitle string   `json:"originalTitle"`
-	StartYear     *int     `json:"startYear"`
-	EndYear       *int     `json:"endYear"`
-	Genres        []string `json:"genres"`
-	AverageRating *float64 `json:"averageRating"`
-	NumVotes      *int     `json:"numVotes"`
-}
-
-type Response struct {
-	Items []Item `json:"items"`
-	Meta  Meta   `json:"meta"`
-}
-
-type Meta struct {
-	Sort           string  `json:"sort"`
-	Limit          int     `json:"limit"`
-	HasMore        bool    `json:"hasMore"`
-	NextCursor     *string `json:"nextCursor,omitempty"`
-	AppliedFilters Filter  `json:"appliedFilters"`
-}
-
-type Filter struct {
-	Type      string   `json:"type"`
-	Genres    []string `json:"genres"`
-	YearFrom  *int     `json:"yearFrom,omitempty"`
-	YearTo    *int     `json:"yearTo,omitempty"`
-	MinVotes  *int     `json:"minVotes,omitempty"`
-	MinRating *float64 `json:"minRating,omitempty"`
-}
-
-type discoverSort string
-
-const (
-	discoverSortPopular  discoverSort = "popular"
-	discoverSortTopRated discoverSort = "top_rated"
-	discoverSortNewest   discoverSort = "newest"
-	discoverSortOldest   discoverSort = "oldest"
-)
-
-type discoverCursor struct {
-	Sort        discoverSort `json:"sort"`
-	Tconst      string       `json:"tconst"`
-	VotesKey    *int         `json:"votesKey,omitempty"`
-	YearKey     *int         `json:"yearKey,omitempty"`
-	RatingKey   *float64     `json:"ratingKey,omitempty"`
-	Fingerprint string       `json:"fingerprint"`
-}
 
 func NewHandler(pool *pgxpool.Pool) echo.HandlerFunc {
+	svc := discovercore.NewService(discovercore.NewPGRepository(pool))
+
 	return func(c *echo.Context) error {
 		typeGroup, err := apiutil.ParseTypeGroup(c.QueryParam("type"))
 		if err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
-		yearFromRaw := strings.TrimSpace(c.QueryParam("year_from"))
-		yearToRaw := strings.TrimSpace(c.QueryParam("year_to"))
 		sortMode, err := parseDiscoverSort(c.QueryParam("sort"))
 		if err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, "sort must be one of: popular, top_rated, newest, oldest")
@@ -88,43 +33,25 @@ func NewHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
-		var yearFrom *int
-		if yearFromRaw != "" {
-			parsed, err := strconv.Atoi(yearFromRaw)
-			if err != nil {
-				return echo.NewHTTPError(http.StatusBadRequest, "invalid year_from")
-			}
-			yearFrom = &parsed
+		yearFrom, err := parseOptionalYear(c.QueryParam("year_from"), "invalid year_from")
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
-
-		var yearTo *int
-		if yearToRaw != "" {
-			parsed, err := strconv.Atoi(yearToRaw)
-			if err != nil {
-				return echo.NewHTTPError(http.StatusBadRequest, "invalid year_to")
-			}
-			yearTo = &parsed
+		yearTo, err := parseOptionalYear(c.QueryParam("year_to"), "invalid year_to")
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 		if yearFrom != nil && yearTo != nil && *yearFrom > *yearTo {
 			return echo.NewHTTPError(http.StatusBadRequest, "year_from must be <= year_to")
 		}
 
-		var minVotes *int
-		if raw := strings.TrimSpace(c.QueryParam("min_votes")); raw != "" {
-			parsed, err := strconv.Atoi(raw)
-			if err != nil || parsed < 0 {
-				return echo.NewHTTPError(http.StatusBadRequest, "invalid min_votes")
-			}
-			minVotes = &parsed
+		minVotes, err := parseOptionalNonNegativeInt(c.QueryParam("min_votes"), "invalid min_votes")
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
-
-		var minRating *float64
-		if raw := strings.TrimSpace(c.QueryParam("min_rating")); raw != "" {
-			parsed, err := strconv.ParseFloat(raw, 64)
-			if err != nil || parsed < 0 || parsed > 10 {
-				return echo.NewHTTPError(http.StatusBadRequest, "invalid min_rating")
-			}
-			minRating = &parsed
+		minRating, err := parseOptionalRating(c.QueryParam("min_rating"))
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
 		limit, err := apiutil.ParseClampedLimit(c.QueryParam("limit"), 20, 1, 50)
@@ -132,241 +59,39 @@ func NewHandler(pool *pgxpool.Pool) echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
-		fingerprint := discoverFilterFingerprint(sortMode, typeGroup, genres, yearFrom, yearTo, minVotes, minRating)
-		var cursor *discoverCursor
-		if raw := strings.TrimSpace(c.QueryParam("cursor")); raw != "" {
-			parsed, err := decodeDiscoverCursor(raw)
-			if err != nil {
-				return echo.NewHTTPError(http.StatusBadRequest, "invalid cursor")
-			}
-			if parsed.Sort != sortMode {
-				return echo.NewHTTPError(http.StatusBadRequest, "cursor sort does not match requested sort")
-			}
-			if parsed.Fingerprint != fingerprint {
-				return echo.NewHTTPError(http.StatusBadRequest, "cursor does not match requested filters")
-			}
-			cursor = &parsed
-		}
-
-		args := make([]any, 0, 16)
-		args = append(args, typeGroup)
-		param := 2
-		var where strings.Builder
-		where.WriteString("WHERE d.type_group = $1")
-		switch sortMode {
-		case discoverSortTopRated:
-			where.WriteString(" AND d.average_rating IS NOT NULL AND d.num_votes IS NOT NULL")
-		case discoverSortNewest, discoverSortOldest:
-			where.WriteString(" AND d.start_year IS NOT NULL AND d.num_votes IS NOT NULL")
-		default:
-			where.WriteString(" AND d.num_votes IS NOT NULL")
-		}
-
-		if yearFrom != nil {
-			where.WriteString(fmt.Sprintf(" AND d.start_year >= $%d", param))
-			args = append(args, *yearFrom)
-			param++
-		}
-		if yearTo != nil {
-			where.WriteString(fmt.Sprintf(" AND d.start_year <= $%d", param))
-			args = append(args, *yearTo)
-			param++
-		}
-		if minVotes != nil {
-			where.WriteString(fmt.Sprintf(" AND d.num_votes >= $%d", param))
-			args = append(args, *minVotes)
-			param++
-		}
-		if minRating != nil {
-			where.WriteString(fmt.Sprintf(" AND d.average_rating >= $%d::numeric", param))
-			args = append(args, *minRating)
-			param++
-		}
-		for _, genre := range genres {
-			where.WriteString(fmt.Sprintf(` AND EXISTS (
-    SELECT 1
-    FROM discover_genre dg
-    WHERE dg.type_group = d.type_group
-      AND dg.tconst = d.tconst
-      AND dg.genre = $%d
-)`, param))
-			args = append(args, genre)
-			param++
-		}
-
-		if cursor != nil {
-			switch sortMode {
-			case discoverSortTopRated:
-				if cursor.RatingKey == nil || cursor.VotesKey == nil {
-					return echo.NewHTTPError(http.StatusBadRequest, "invalid cursor")
-				}
-				where.WriteString(fmt.Sprintf(" AND (d.average_rating, d.num_votes, d.tconst) < ($%d::numeric, $%d, $%d)", param, param+1, param+2))
-				args = append(args, *cursor.RatingKey, *cursor.VotesKey, cursor.Tconst)
-				param += 3
-			case discoverSortNewest:
-				if cursor.YearKey == nil || cursor.VotesKey == nil {
-					return echo.NewHTTPError(http.StatusBadRequest, "invalid cursor")
-				}
-				where.WriteString(fmt.Sprintf(" AND (d.start_year, d.num_votes, d.tconst) < ($%d, $%d, $%d)", param, param+1, param+2))
-				args = append(args, *cursor.YearKey, *cursor.VotesKey, cursor.Tconst)
-				param += 3
-			case discoverSortOldest:
-				if cursor.YearKey == nil || cursor.VotesKey == nil {
-					return echo.NewHTTPError(http.StatusBadRequest, "invalid cursor")
-				}
-				where.WriteString(fmt.Sprintf(" AND (d.start_year > $%d OR (d.start_year = $%d AND (d.num_votes, d.tconst) < ($%d, $%d)))", param, param, param+1, param+2))
-				args = append(args, *cursor.YearKey, *cursor.VotesKey, cursor.Tconst)
-				param += 3
-			default:
-				if cursor.VotesKey == nil {
-					return echo.NewHTTPError(http.StatusBadRequest, "invalid cursor")
-				}
-				where.WriteString(fmt.Sprintf(" AND (d.num_votes, d.tconst) < ($%d, $%d)", param, param+1))
-				args = append(args, *cursor.VotesKey, cursor.Tconst)
-				param += 2
-			}
-		}
-
-		sqlLimit := limit + 1
-		args = append(args, sqlLimit)
-		orderClause := discoverOrderClause(sortMode)
-		sql := fmt.Sprintf(`
-SELECT d.tconst, d.title_type, d.primary_title, d.original_title, d.start_year, d.end_year,
-       d.genres, d.average_rating::float8, d.num_votes
-FROM discover_core d
-%s
-ORDER BY %s
-LIMIT $%d`, where.String(), orderClause, param)
-
-		ctx := c.Request().Context()
-		rows, err := pool.Query(ctx, sql, args...)
+		resp, err := svc.Discover(c.Request().Context(), discovercore.Request{
+			TypeGroup: typeGroup,
+			Genres:    genres,
+			YearFrom:  yearFrom,
+			YearTo:    yearTo,
+			MinVotes:  minVotes,
+			MinRating: minRating,
+			Sort:      sortMode,
+			Limit:     limit,
+			Cursor:    c.QueryParam("cursor"),
+		})
 		if err != nil {
+			var validationErr *discovercore.ValidationError
+			if errors.As(err, &validationErr) {
+				return echo.NewHTTPError(http.StatusBadRequest, validationErr.Message)
+			}
 			return err
-		}
-		defer rows.Close()
-
-		results := make([]Item, 0, sqlLimit)
-		rowCursors := make([]discoverCursor, 0, sqlLimit)
-		for rows.Next() {
-			var (
-				tconst        string
-				ttype         string
-				primaryTitle  string
-				originalTitle string
-				startYear     pgtype.Int4
-				endYear       pgtype.Int4
-				genresArr     []string
-				avgRating     pgtype.Float8
-				numVotes      pgtype.Int4
-			)
-			if err := rows.Scan(
-				&tconst,
-				&ttype,
-				&primaryTitle,
-				&originalTitle,
-				&startYear,
-				&endYear,
-				&genresArr,
-				&avgRating,
-				&numVotes,
-			); err != nil {
-				return err
-			}
-			if genresArr == nil {
-				genresArr = []string{}
-			}
-			item := Item{
-				Tconst:        tconst,
-				TitleType:     ttype,
-				PrimaryTitle:  primaryTitle,
-				OriginalTitle: originalTitle,
-				StartYear:     intPtrFromPg(startYear),
-				EndYear:       intPtrFromPg(endYear),
-				Genres:        genresArr,
-				AverageRating: floatPtrFromPg(avgRating),
-				NumVotes:      intPtrFromPg(numVotes),
-			}
-			results = append(results, item)
-
-			cur := discoverCursor{
-				Sort:        sortMode,
-				Tconst:      tconst,
-				Fingerprint: fingerprint,
-			}
-			cur.VotesKey = intPtrFromPg(numVotes)
-			if cur.VotesKey == nil {
-				return errors.New("discover cursor invariant: missing votes key")
-			}
-			switch sortMode {
-			case discoverSortTopRated:
-				cur.RatingKey = floatPtrFromPg(avgRating)
-				if cur.RatingKey == nil {
-					return errors.New("discover cursor invariant: missing rating key")
-				}
-			case discoverSortNewest:
-				cur.YearKey = intPtrFromPg(startYear)
-				if cur.YearKey == nil {
-					return errors.New("discover cursor invariant: missing year key")
-				}
-			case discoverSortOldest:
-				cur.YearKey = intPtrFromPg(startYear)
-				if cur.YearKey == nil {
-					return errors.New("discover cursor invariant: missing year key")
-				}
-			}
-			rowCursors = append(rowCursors, cur)
-		}
-		if err := rows.Err(); err != nil {
-			return err
-		}
-
-		hasMore := len(results) > limit
-		if hasMore {
-			results = results[:limit]
-			rowCursors = rowCursors[:limit]
-		}
-
-		var nextCursor *string
-		if hasMore && len(rowCursors) > 0 {
-			encoded, err := encodeDiscoverCursor(rowCursors[len(rowCursors)-1])
-			if err != nil {
-				return err
-			}
-			nextCursor = &encoded
-		}
-
-		resp := Response{
-			Items: results,
-			Meta: Meta{
-				Sort:       string(sortMode),
-				Limit:      limit,
-				HasMore:    hasMore,
-				NextCursor: nextCursor,
-				AppliedFilters: Filter{
-					Type:      typeGroup,
-					Genres:    genres,
-					YearFrom:  yearFrom,
-					YearTo:    yearTo,
-					MinVotes:  minVotes,
-					MinRating: minRating,
-				},
-			},
 		}
 
 		return c.JSON(http.StatusOK, resp)
 	}
 }
 
-func parseDiscoverSort(raw string) (discoverSort, error) {
+func parseDiscoverSort(raw string) (discovercore.Sort, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "", "popular":
-		return discoverSortPopular, nil
-	case "top_rated":
-		return discoverSortTopRated, nil
-	case "newest":
-		return discoverSortNewest, nil
-	case "oldest":
-		return discoverSortOldest, nil
+	case "", string(discovercore.SortPopular):
+		return discovercore.SortPopular, nil
+	case string(discovercore.SortTopRated):
+		return discovercore.SortTopRated, nil
+	case string(discovercore.SortNewest):
+		return discovercore.SortNewest, nil
+	case string(discovercore.SortOldest):
+		return discovercore.SortOldest, nil
 	default:
 		return "", errors.New("invalid sort")
 	}
@@ -398,90 +123,35 @@ func parseDiscoverGenres(c *echo.Context) ([]string, error) {
 	return genres, nil
 }
 
-func encodeDiscoverCursor(cur discoverCursor) (string, error) {
-	data, err := json.Marshal(cur)
+func parseOptionalYear(raw string, message string) (*int, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	parsed, err := strconv.Atoi(strings.TrimSpace(raw))
 	if err != nil {
-		return "", err
+		return nil, errors.New(message)
 	}
-	return base64.RawURLEncoding.EncodeToString(data), nil
+	return &parsed, nil
 }
 
-func decodeDiscoverCursor(raw string) (discoverCursor, error) {
-	var cur discoverCursor
-	data, err := base64.RawURLEncoding.DecodeString(raw)
-	if err != nil {
-		return cur, err
+func parseOptionalNonNegativeInt(raw string, message string) (*int, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
 	}
-	if err := json.Unmarshal(data, &cur); err != nil {
-		return cur, err
+	parsed, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || parsed < 0 {
+		return nil, errors.New(message)
 	}
-	if cur.Tconst == "" || cur.Sort == "" || cur.Fingerprint == "" {
-		return cur, errors.New("invalid cursor payload")
-	}
-	return cur, nil
+	return &parsed, nil
 }
 
-func discoverFilterFingerprint(
-	sortMode discoverSort,
-	typeGroup string,
-	genres []string,
-	yearFrom *int,
-	yearTo *int,
-	minVotes *int,
-	minRating *float64,
-) string {
-	yearFromToken := ""
-	if yearFrom != nil {
-		yearFromToken = strconv.Itoa(*yearFrom)
+func parseOptionalRating(raw string) (*float64, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
 	}
-	yearToToken := ""
-	if yearTo != nil {
-		yearToToken = strconv.Itoa(*yearTo)
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil || parsed < 0 || parsed > 10 {
+		return nil, errors.New("invalid min_rating")
 	}
-	minVotesToken := ""
-	if minVotes != nil {
-		minVotesToken = strconv.Itoa(*minVotes)
-	}
-	minRatingToken := ""
-	if minRating != nil {
-		minRatingToken = strconv.FormatFloat(*minRating, 'f', 4, 64)
-	}
-	return strings.Join([]string{
-		string(sortMode),
-		typeGroup,
-		strings.Join(genres, ","),
-		yearFromToken,
-		yearToToken,
-		minVotesToken,
-		minRatingToken,
-	}, "|")
-}
-
-func discoverOrderClause(sortMode discoverSort) string {
-	switch sortMode {
-	case discoverSortTopRated:
-		return "d.average_rating DESC NULLS LAST, d.num_votes DESC NULLS LAST, d.tconst DESC"
-	case discoverSortNewest:
-		return "d.start_year DESC NULLS LAST, d.num_votes DESC NULLS LAST, d.tconst DESC"
-	case discoverSortOldest:
-		return "d.start_year ASC NULLS LAST, d.num_votes DESC NULLS LAST, d.tconst DESC"
-	default:
-		return "d.num_votes DESC NULLS LAST, d.tconst DESC"
-	}
-}
-
-func intPtrFromPg(val pgtype.Int4) *int {
-	if !val.Valid {
-		return nil
-	}
-	v := int(val.Int32)
-	return &v
-}
-
-func floatPtrFromPg(val pgtype.Float8) *float64 {
-	if !val.Valid {
-		return nil
-	}
-	v := val.Float64
-	return &v
+	return &parsed, nil
 }
