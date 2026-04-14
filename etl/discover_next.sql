@@ -25,7 +25,15 @@ SELECT
   original_title,
   start_year,
   end_year,
-  genres,
+  CASE
+    WHEN genres IS NULL THEN NULL
+    ELSE ARRAY(
+      SELECT lower(btrim(genre))
+      FROM unnest(genres) AS genre
+      WHERE genre IS NOT NULL
+        AND btrim(genre) <> ''
+    )
+  END AS genres,
   average_rating,
   num_votes
 FROM titles_next
@@ -59,7 +67,15 @@ SELECT
   t.original_title,
   t.start_year,
   t.end_year,
-  t.genres,
+  CASE
+    WHEN t.genres IS NULL THEN NULL
+    ELSE ARRAY(
+      SELECT lower(btrim(genre))
+      FROM unnest(t.genres) AS genre
+      WHERE genre IS NOT NULL
+        AND btrim(genre) <> ''
+    )
+  END AS genres,
   t.average_rating,
   t.num_votes,
   lower(btrim(g.genre))

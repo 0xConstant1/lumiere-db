@@ -54,15 +54,9 @@ func (r *PGRepository) List(ctx context.Context, q query) ([]row, error) {
 		args = append(args, *q.MinRating)
 		param++
 	}
-	for _, genre := range q.Genres {
-		where.WriteString(fmt.Sprintf(` AND EXISTS (
-    SELECT 1
-    FROM discover_genre dg
-    WHERE dg.type_group = d.type_group
-      AND dg.tconst = d.tconst
-      AND dg.genre = $%d
-)`, param))
-		args = append(args, genre)
+	if len(q.Genres) > 0 {
+		where.WriteString(fmt.Sprintf(" AND d.genres @> $%d::text[]", param))
+		args = append(args, q.Genres)
 		param++
 	}
 
