@@ -22,17 +22,14 @@ func runETL(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log.Log
 	}
 
 	if err := downloadDatasets(ctx, cfg, logger); err != nil {
-		return err
+		return fmt.Errorf("download datasets: %w", err)
 	}
 
-	if err := runSQLFile(ctx, pool, cfg, logger, "schema.sql"); err != nil {
-		return err
-	}
-	if err := runSQLFile(ctx, pool, cfg, logger, "staging.sql"); err != nil {
+	if err := runSQLScripts(ctx, pool, cfg, logger, "schema.sql", "staging.sql"); err != nil {
 		return err
 	}
 	if err := loadStagingInBatches(ctx, pool, cfg, logger); err != nil {
-		return err
+		return fmt.Errorf("load staging data: %w", err)
 	}
 
 	preBuildScripts := []string{
@@ -41,14 +38,12 @@ func runETL(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log.Log
 		"filter_titles.sql",
 		"create_next.sql",
 	}
-	for _, script := range preBuildScripts {
-		if err := runSQLFile(ctx, pool, cfg, logger, script); err != nil {
-			return err
-		}
+	if err := runSQLScripts(ctx, pool, cfg, logger, preBuildScripts...); err != nil {
+		return err
 	}
 
 	if err := buildTitlesInBatches(ctx, pool, cfg, logger); err != nil {
-		return err
+		return fmt.Errorf("build titles: %w", err)
 	}
 
 	postBuildScripts := []string{
@@ -65,12 +60,19 @@ func runETL(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log.Log
 	} else {
 		postBuildScripts = append(postBuildScripts, "cleanup.sql")
 	}
-	for _, script := range postBuildScripts {
-		if err := runSQLFile(ctx, pool, cfg, logger, script); err != nil {
-			return err
-		}
+	if err := runSQLScripts(ctx, pool, cfg, logger, postBuildScripts...); err != nil {
+		return err
 	}
 
 	logger.Printf("etl: finished")
+	return nil
+}
+
+func runSQLScripts(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log.Logger, scripts ...string) error {
+	for _, script := range scripts {
+		if err := runSQLFile(ctx, pool, cfg, logger, script); err != nil {
+			return fmt.Errorf("run %s: %w", script, err)
+		}
+	}
 	return nil
 }

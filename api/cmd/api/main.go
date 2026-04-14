@@ -31,7 +31,7 @@ func main() {
 	}
 	defer pool.Close()
 
-	etlCfg := cfg.ETL.Core()
+	etlCfg := cfg.ETL.Runtime
 	if cfg.ETL.Enabled {
 		if cfg.ETL.ScheduleEnabled {
 			needsBootstrap, err := etlcore.ShouldRunBlockingBootstrap(ctx, pool)

@@ -2,6 +2,7 @@ package etl
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -9,17 +10,17 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-type queryer interface {
+type querier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
-func fetchBasics(ctx context.Context, q queryer, tconsts []string) (map[string]TitleBasics, error) {
+func fetchBasics(ctx context.Context, q querier, tconsts []string) (map[string]TitleBasics, error) {
 	rows, err := q.Query(ctx, `
 SELECT tconst, titleType, primaryTitle, originalTitle, isAdult, startYear, endYear, runtimeMinutes, genres
 FROM stg_title_basics
-WHERE tconst = ANY($1)`, tconsts)
+	WHERE tconst = ANY($1)`, tconsts)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch basics query: %w", err)
 	}
 	defer rows.Close()
 
@@ -37,7 +38,7 @@ WHERE tconst = ANY($1)`, tconsts)
 			genres        string
 		)
 		if err := rows.Scan(&tconst, &titleType, &primaryTitle, &originalTitle, &isAdult, &startYear, &endYear, &runtime, &genres); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("fetch basics scan: %w", err)
 		}
 
 		titleType = strings.ToLower(strings.TrimSpace(titleType))
@@ -55,16 +56,19 @@ WHERE tconst = ANY($1)`, tconsts)
 			Genres:         splitList(genres),
 		}
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("fetch basics rows: %w", err)
+	}
+	return out, nil
 }
 
-func fetchRatings(ctx context.Context, q queryer, tconsts []string) (map[string]Rating, error) {
+func fetchRatings(ctx context.Context, q querier, tconsts []string) (map[string]Rating, error) {
 	rows, err := q.Query(ctx, `
 SELECT tconst, averageRating, numVotes
 FROM stg_title_ratings
-WHERE tconst = ANY($1)`, tconsts)
+	WHERE tconst = ANY($1)`, tconsts)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch ratings query: %w", err)
 	}
 	defer rows.Close()
 
@@ -76,31 +80,34 @@ WHERE tconst = ANY($1)`, tconsts)
 			votes  pgtype.Int4
 		)
 		if err := rows.Scan(&tconst, &avg, &votes); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("fetch ratings scan: %w", err)
 		}
 		out[tconst] = Rating{
 			AverageRating: floatPtrFromPg(avg),
 			NumVotes:      intPtrFromPg(votes),
 		}
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("fetch ratings rows: %w", err)
+	}
+	return out, nil
 }
 
-func fetchAkas(ctx context.Context, q queryer, tconsts []string) (map[string]map[string][]Aka, error) {
+func fetchAkas(ctx context.Context, q querier, tconsts []string) (map[string]map[string][]Aka, error) {
 	rows, err := q.Query(ctx, `
 SELECT titleId, ordering, title, region, language, types, attributes, isOriginalTitle
 FROM stg_title_akas
 WHERE titleId = ANY($1)
-ORDER BY titleId, ordering`, tconsts)
+	ORDER BY titleId, ordering`, tconsts)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch akas query: %w", err)
 	}
 	defer rows.Close()
 
 	out := make(map[string]map[string][]Aka)
 	for rows.Next() {
 		var (
-			titleId         string
+			titleID         string
 			ordering        pgtype.Int4
 			title           string
 			region          string
@@ -109,8 +116,8 @@ ORDER BY titleId, ordering`, tconsts)
 			attributes      string
 			isOriginalTitle pgtype.Bool
 		)
-		if err := rows.Scan(&titleId, &ordering, &title, &region, &language, &types, &attributes, &isOriginalTitle); err != nil {
-			return nil, err
+		if err := rows.Scan(&titleID, &ordering, &title, &region, &language, &types, &attributes, &isOriginalTitle); err != nil {
+			return nil, fmt.Errorf("fetch akas scan: %w", err)
 		}
 
 		region = strings.TrimSpace(nullIfNA(region))
@@ -131,14 +138,14 @@ ORDER BY titleId, ordering`, tconsts)
 			Ordering:        orderVal,
 		}
 
-		if _, ok := out[titleId]; !ok {
-			out[titleId] = make(map[string][]Aka)
+		if _, ok := out[titleID]; !ok {
+			out[titleID] = make(map[string][]Aka)
 		}
-		out[titleId][region] = append(out[titleId][region], aka)
+		out[titleID][region] = append(out[titleID][region], aka)
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch akas rows: %w", err)
 	}
 
 	for _, byRegion := range out {
@@ -168,7 +175,7 @@ ORDER BY titleId, ordering`, tconsts)
 	return out, nil
 }
 
-func fetchPrincipals(ctx context.Context, q queryer, tconsts []string, maxActors int, maxProducers int) ([]principalRow, error) {
+func fetchPrincipals(ctx context.Context, q querier, tconsts []string, maxActors int, maxProducers int) ([]principalRow, error) {
 	if maxActors <= 0 && maxProducers <= 0 {
 		return []principalRow{}, nil
 	}
@@ -192,9 +199,9 @@ SELECT tconst, ordering, nconst, category, characters
 FROM ranked
 WHERE (is_actor = 1 AND rn <= $2)
    OR (is_actor = 0 AND rn <= $3)
-ORDER BY tconst, ordering`, tconsts, maxActors, maxProducers)
+	ORDER BY tconst, ordering`, tconsts, maxActors, maxProducers)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch principals query: %w", err)
 	}
 	defer rows.Close()
 
@@ -208,7 +215,7 @@ ORDER BY tconst, ordering`, tconsts, maxActors, maxProducers)
 			characters string
 		)
 		if err := rows.Scan(&tconst, &ordering, &nconst, &category, &characters); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("fetch principals scan: %w", err)
 		}
 		ord := 0
 		if ordering.Valid {
@@ -222,16 +229,19 @@ ORDER BY tconst, ordering`, tconsts, maxActors, maxProducers)
 			Characters: characters,
 		})
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("fetch principals rows: %w", err)
+	}
+	return out, nil
 }
 
-func fetchCrew(ctx context.Context, q queryer, tconsts []string) (map[string]crewLists, error) {
+func fetchCrew(ctx context.Context, q querier, tconsts []string) (map[string]crewLists, error) {
 	rows, err := q.Query(ctx, `
 SELECT tconst, directors, writers
 FROM stg_title_crew
-WHERE tconst = ANY($1)`, tconsts)
+	WHERE tconst = ANY($1)`, tconsts)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch crew query: %w", err)
 	}
 	defer rows.Close()
 
@@ -239,17 +249,20 @@ WHERE tconst = ANY($1)`, tconsts)
 	for rows.Next() {
 		var tconst, directors, writers string
 		if err := rows.Scan(&tconst, &directors, &writers); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("fetch crew scan: %w", err)
 		}
 		out[tconst] = crewLists{
 			Directors: splitList(directors),
 			Writers:   splitList(writers),
 		}
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("fetch crew rows: %w", err)
+	}
+	return out, nil
 }
 
-func fetchNames(ctx context.Context, q queryer, nconsts []string) (map[string]string, error) {
+func fetchNames(ctx context.Context, q querier, nconsts []string) (map[string]string, error) {
 	if len(nconsts) == 0 {
 		return map[string]string{}, nil
 	}
@@ -257,9 +270,9 @@ func fetchNames(ctx context.Context, q queryer, nconsts []string) (map[string]st
 	rows, err := q.Query(ctx, `
 SELECT nconst, primaryName
 FROM stg_name_basics
-WHERE nconst = ANY($1)`, nconsts)
+	WHERE nconst = ANY($1)`, nconsts)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch names query: %w", err)
 	}
 	defer rows.Close()
 
@@ -267,14 +280,17 @@ WHERE nconst = ANY($1)`, nconsts)
 	for rows.Next() {
 		var nconst, name string
 		if err := rows.Scan(&nconst, &name); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("fetch names scan: %w", err)
 		}
 		out[nconst] = name
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("fetch names rows: %w", err)
+	}
+	return out, nil
 }
 
-func fetchEpisodes(ctx context.Context, q queryer, tconsts []string) (map[string][]Season, error) {
+func fetchEpisodes(ctx context.Context, q querier, tconsts []string) (map[string][]Season, error) {
 	if len(tconsts) == 0 {
 		return map[string][]Season{}, nil
 	}
@@ -284,9 +300,9 @@ SELECT parent_tconst, tconst, season_number, episode_number,
        primary_title, start_year, average_rating, num_votes
 FROM stg_episode_enriched
 WHERE parent_tconst = ANY($1)
-ORDER BY parent_tconst, season_number NULLS LAST, episode_number NULLS LAST, tconst`, tconsts)
+	ORDER BY parent_tconst, season_number NULLS LAST, episode_number NULLS LAST, tconst`, tconsts)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch episodes query: %w", err)
 	}
 	defer rows.Close()
 
@@ -303,7 +319,7 @@ ORDER BY parent_tconst, season_number NULLS LAST, episode_number NULLS LAST, tco
 			numVotes     pgtype.Int4
 		)
 		if err := rows.Scan(&parentTconst, &tconst, &seasonNum, &episodeNum, &primaryTitle, &startYear, &avgRating, &numVotes); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("fetch episodes scan: %w", err)
 		}
 
 		if _, ok := byParent[parentTconst]; !ok {
@@ -328,7 +344,7 @@ ORDER BY parent_tconst, season_number NULLS LAST, episode_number NULLS LAST, tco
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch episodes rows: %w", err)
 	}
 
 	out := make(map[string][]Season, len(byParent))

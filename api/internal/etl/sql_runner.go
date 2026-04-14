@@ -2,7 +2,6 @@ package etl
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -26,7 +25,7 @@ func runSQLFile(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log
 	sqlText = strings.ReplaceAll(sqlText, "{{dataset_date}}", cfg.DatasetDate)
 	sqlText = strings.ReplaceAll(sqlText, "{{schema_version}}", strconv.Itoa(cfg.SchemaVersion))
 	sqlText = strings.ReplaceAll(sqlText, "{{min_num_votes}}", strconv.Itoa(cfg.MinNumVotes))
-	sqlText = strings.ReplaceAll(sqlText, "{{swap_lock_timeout}}", cfg.SwapLockTimeout)
+	sqlText = strings.ReplaceAll(sqlText, "{{swap_lock_timeout}}", cfg.SwapLockTimeout.String())
 
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
@@ -35,10 +34,10 @@ func runSQLFile(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log
 	defer conn.Release()
 
 	if err := applyETLSettings(ctx, conn, cfg); err != nil {
-		return err
+		return fmt.Errorf("apply etl settings: %w", err)
 	}
 	if err := logETLSettings(ctx, conn, logger); err != nil {
-		return err
+		return fmt.Errorf("log etl settings: %w", err)
 	}
 
 	logger.Printf("etl: running %s", filename)
@@ -51,29 +50,20 @@ func runSQLFile(ctx context.Context, pool *pgxpool.Pool, cfg Config, logger *log
 }
 
 func applyETLSettings(ctx context.Context, conn *pgxpool.Conn, cfg Config) error {
-	if cfg.MaxParallelWorkers != "" {
-		if _, err := strconv.Atoi(cfg.MaxParallelWorkers); err != nil {
-			return fmt.Errorf("ETL_MAX_PARALLEL_WORKERS invalid: %w", err)
-		}
-		if _, err := conn.Exec(ctx, "SET max_parallel_workers_per_gather = "+cfg.MaxParallelWorkers); err != nil {
+	if cfg.MaxParallelWorkers != nil {
+		if _, err := conn.Exec(ctx, "SELECT set_config('max_parallel_workers_per_gather', $1, false)", strconv.Itoa(*cfg.MaxParallelWorkers)); err != nil {
 			return fmt.Errorf("set max_parallel_workers_per_gather: %w", err)
 		}
 	}
 
-	if cfg.WorkMem != "" {
-		if strings.Contains(cfg.WorkMem, "'") {
-			return errors.New("ETL_WORK_MEM contains invalid character")
-		}
-		if _, err := conn.Exec(ctx, "SET work_mem = '"+cfg.WorkMem+"'"); err != nil {
+	if !cfg.WorkMem.isZero() {
+		if _, err := conn.Exec(ctx, "SELECT set_config('work_mem', $1, false)", cfg.WorkMem.postgresValue()); err != nil {
 			return fmt.Errorf("set work_mem: %w", err)
 		}
 	}
 
-	if cfg.MaintenanceWorkMem != "" {
-		if strings.Contains(cfg.MaintenanceWorkMem, "'") {
-			return errors.New("ETL_MAINTENANCE_WORK_MEM contains invalid character")
-		}
-		if _, err := conn.Exec(ctx, "SET maintenance_work_mem = '"+cfg.MaintenanceWorkMem+"'"); err != nil {
+	if !cfg.MaintenanceWorkMem.isZero() {
+		if _, err := conn.Exec(ctx, "SELECT set_config('maintenance_work_mem', $1, false)", cfg.MaintenanceWorkMem.postgresValue()); err != nil {
 			return fmt.Errorf("set maintenance_work_mem: %w", err)
 		}
 	}

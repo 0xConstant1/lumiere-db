@@ -268,6 +268,8 @@ func clampInt(val int, min int, max int) int {
 	return val
 }
 
+// computeTitlePopularity keeps the score bounded while blending long-term
+// popularity (votes) with a smaller recency boost for newer titles.
 func computeTitlePopularity(numVotes *int, startYear *int, datasetYear int) int {
 	const (
 		voteWeight      = 0.85

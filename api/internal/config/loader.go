@@ -3,10 +3,13 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	etlcore "lumiere-api/internal/etl"
 )
 
 func Load() (Config, error) {
@@ -16,12 +19,12 @@ func Load() (Config, error) {
 		return cfg, errors.New("DATABASE_URL is required")
 	}
 
-	cfg.ETL.BaseURL = envString("IMDB_BASE_URL", "https://datasets.imdbws.com")
-	cfg.ETL.DataDir = envString("IMDB_DATA_DIR", "/data")
-	cfg.ETL.DatasetDate = envString("DATASET_DATE", time.Now().UTC().Format("2006-01-02"))
+	cfg.ETL.Runtime.BaseURL = envString("IMDB_BASE_URL", "https://datasets.imdbws.com")
+	cfg.ETL.Runtime.DataDir = envString("IMDB_DATA_DIR", "/data")
+	cfg.ETL.Runtime.DatasetDate = envString("DATASET_DATE", time.Now().UTC().Format("2006-01-02"))
 	var err error
 
-	cfg.ETL.SchemaVersion, err = envInt("SCHEMA_VERSION", 1)
+	cfg.ETL.Runtime.SchemaVersion, err = envInt("SCHEMA_VERSION", 1)
 	if err != nil {
 		return cfg, err
 	}
@@ -29,16 +32,16 @@ func Load() (Config, error) {
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ETL.EnablePGSearch = cfg.EnablePGSearch
+	cfg.ETL.Runtime.EnablePGSearch = cfg.EnablePGSearch
 	cfg.ETL.Enabled, err = envBool("RUN_ETL", true)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ETL.ForceDownload, err = envBool("IMDB_FORCE_DOWNLOAD", false)
+	cfg.ETL.Runtime.ForceDownload, err = envBool("IMDB_FORCE_DOWNLOAD", false)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ETL.KeepStaging, err = envBool("ETL_KEEP_STAGING", false)
+	cfg.ETL.Runtime.KeepStaging, err = envBool("ETL_KEEP_STAGING", false)
 	if err != nil {
 		return cfg, err
 	}
@@ -46,72 +49,84 @@ func Load() (Config, error) {
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ETL.LoadBatchSize = clampPositive(loadBatchSize, 10000)
+	cfg.ETL.Runtime.LoadBatchSize = clampPositive(loadBatchSize, 10000)
 	batchSize, err := envInt("ETL_BATCH_SIZE", 10000)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ETL.BatchSize = clampPositive(batchSize, 10000)
+	cfg.ETL.Runtime.BatchSize = clampPositive(batchSize, 10000)
 	maxActors, err := envInt("ETL_MAX_ACTORS", 10)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ETL.MaxActors = clampNonNegative(maxActors)
+	cfg.ETL.Runtime.MaxActors = clampNonNegative(maxActors)
 	maxProducers, err := envInt("ETL_MAX_PRODUCERS", 1)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ETL.MaxProducers = clampNonNegative(maxProducers)
+	cfg.ETL.Runtime.MaxProducers = clampNonNegative(maxProducers)
 	maxWriters, err := envInt("ETL_MAX_WRITERS", 1)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ETL.MaxWriters = clampNonNegative(maxWriters)
+	cfg.ETL.Runtime.MaxWriters = clampNonNegative(maxWriters)
 	maxDirectors, err := envInt("ETL_MAX_DIRECTORS", 1)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ETL.MaxDirectors = clampNonNegative(maxDirectors)
-	cfg.ETL.MaxParallelWorkers = strings.TrimSpace(os.Getenv("ETL_MAX_PARALLEL_WORKERS"))
-	cfg.ETL.WorkMem = strings.TrimSpace(os.Getenv("ETL_WORK_MEM"))
-	cfg.ETL.MaintenanceWorkMem = strings.TrimSpace(os.Getenv("ETL_MAINTENANCE_WORK_MEM"))
+	cfg.ETL.Runtime.MaxDirectors = clampNonNegative(maxDirectors)
+	cfg.ETL.Runtime.MaxParallelWorkers, err = envOptionalInt("ETL_MAX_PARALLEL_WORKERS")
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ETL.Runtime.WorkMem, err = envOptionalMemorySize("ETL_WORK_MEM")
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ETL.Runtime.MaintenanceWorkMem, err = envOptionalMemorySize("ETL_MAINTENANCE_WORK_MEM")
+	if err != nil {
+		return cfg, err
+	}
 	readerBufferSize, err := envInt("ETL_READER_BUFFER", 256*1024)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ETL.ReaderBufferSize = clampPositive(readerBufferSize, 256*1024)
+	cfg.ETL.Runtime.ReaderBufferSize = clampPositive(readerBufferSize, 256*1024)
 	downloadConcurrency, err := envInt("ETL_DOWNLOAD_CONCURRENCY", 3)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ETL.DownloadConcurrency = clampPositive(downloadConcurrency, 3)
+	cfg.ETL.Runtime.DownloadConcurrency = clampPositive(downloadConcurrency, 3)
 	minNumVotes, err := envInt("ETL_MIN_NUMVOTES", 1)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ETL.MinNumVotes = clampNonNegative(minNumVotes)
+	cfg.ETL.Runtime.MinNumVotes = clampNonNegative(minNumVotes)
 	cfg.ETL.ScheduleEnabled, err = envBool("ETL_SCHEDULE_ENABLED", true)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ETL.PollInterval, err = envDuration("ETL_POLL_INTERVAL", time.Hour)
+	cfg.ETL.Runtime.PollInterval, err = envDuration("ETL_POLL_INTERVAL", time.Hour)
 	if err != nil {
 		return cfg, err
 	}
-	if cfg.ETL.PollInterval <= 0 {
+	if cfg.ETL.Runtime.PollInterval <= 0 {
 		return cfg, errors.New("ETL_POLL_INTERVAL must be greater than 0")
 	}
 	cfg.ETL.BootstrapBlocking, err = envBool("ETL_BOOTSTRAP_BLOCKING", true)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ETL.ForceRebuild, err = envBool("IMDB_FORCE_REBUILD", false)
+	cfg.ETL.Runtime.ForceRebuild, err = envBool("IMDB_FORCE_REBUILD", false)
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ETL.SwapLockTimeout = envString("ETL_SWAP_LOCK_TIMEOUT", "30s")
-	if strings.Contains(cfg.ETL.SwapLockTimeout, "'") || strings.Contains(cfg.ETL.SwapLockTimeout, ";") {
-		return cfg, errors.New("ETL_SWAP_LOCK_TIMEOUT contains invalid character")
+	cfg.ETL.Runtime.SwapLockTimeout, err = envDuration("ETL_SWAP_LOCK_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return cfg, err
+	}
+	if cfg.ETL.Runtime.SwapLockTimeout <= 0 {
+		return cfg, errors.New("ETL_SWAP_LOCK_TIMEOUT must be greater than 0")
 	}
 	cfg.Port = envString("PORT", "8000")
 	cfg.CORSAllowOrigins, err = envCSV("CORS_ALLOW_ORIGINS", []string{
@@ -134,7 +149,7 @@ func Load() (Config, error) {
 	if err != nil {
 		return cfg, err
 	}
-	cfg.ETL.SQLDir = sqlDir
+	cfg.ETL.Runtime.SQLDir = sqlDir
 
 	return cfg, nil
 }
@@ -186,6 +201,33 @@ func envDuration(key string, def time.Duration) (time.Duration, error) {
 	return dur, nil
 }
 
+func envOptionalInt(key string) (*int, error) {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		return nil, nil
+	}
+	parsed, err := strconv.Atoi(val)
+	if err != nil {
+		return nil, fmt.Errorf("%s has invalid integer value %q", key, val)
+	}
+	if parsed < 0 {
+		return nil, fmt.Errorf("%s must be greater than or equal to 0", key)
+	}
+	return &parsed, nil
+}
+
+func envOptionalMemorySize(key string) (etlcore.MemorySize, error) {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		return 0, nil
+	}
+	size, err := parseMemorySize(val)
+	if err != nil {
+		return 0, fmt.Errorf("%s has invalid memory value %q: %w", key, val, err)
+	}
+	return size, nil
+}
+
 func envCSV(key string, def []string) ([]string, error) {
 	val := strings.TrimSpace(os.Getenv(key))
 	if val == "" {
@@ -212,6 +254,52 @@ func envCSV(key string, def []string) ([]string, error) {
 		return nil, fmt.Errorf("%s must contain at least one value", key)
 	}
 	return out, nil
+}
+
+func parseMemorySize(raw string) (etlcore.MemorySize, error) {
+	raw = strings.TrimSpace(raw)
+	idx := 0
+	for idx < len(raw) && raw[idx] >= '0' && raw[idx] <= '9' {
+		idx++
+	}
+	if idx == 0 {
+		return 0, errors.New("missing numeric size")
+	}
+
+	value, err := strconv.ParseInt(raw[:idx], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if value <= 0 {
+		return 0, errors.New("size must be greater than 0")
+	}
+
+	unit := strings.ToLower(strings.TrimSpace(raw[idx:]))
+	multiplier, ok := memoryUnitMultiplier(unit)
+	if !ok {
+		return 0, fmt.Errorf("unsupported unit %q", unit)
+	}
+	if value > math.MaxInt64/multiplier {
+		return 0, errors.New("size overflows int64")
+	}
+	return etlcore.MemorySize(value * multiplier), nil
+}
+
+func memoryUnitMultiplier(unit string) (int64, bool) {
+	switch unit {
+	case "", "k", "kb", "kib":
+		return 1024, true
+	case "b":
+		return 1, true
+	case "m", "mb", "mib":
+		return 1024 * 1024, true
+	case "g", "gb", "gib":
+		return 1024 * 1024 * 1024, true
+	case "t", "tb", "tib":
+		return 1024 * 1024 * 1024 * 1024, true
+	default:
+		return 0, false
+	}
 }
 
 func resolveSQLDir(envVal string) (string, error) {

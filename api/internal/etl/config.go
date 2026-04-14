@@ -1,6 +1,20 @@
 package etl
 
-import "time"
+import (
+	"strconv"
+	"time"
+)
+
+type MemorySize int64
+
+func (m MemorySize) isZero() bool {
+	return m == 0
+}
+
+func (m MemorySize) postgresValue() string {
+	kib := (int64(m) + 1023) / 1024
+	return strconv.FormatInt(kib, 10) + "kB"
+}
 
 type Config struct {
 	BaseURL             string
@@ -17,13 +31,13 @@ type Config struct {
 	MaxProducers        int
 	MaxWriters          int
 	MaxDirectors        int
-	MaxParallelWorkers  string
-	WorkMem             string
-	MaintenanceWorkMem  string
+	MaxParallelWorkers  *int
+	WorkMem             MemorySize
+	MaintenanceWorkMem  MemorySize
 	ReaderBufferSize    int
 	DownloadConcurrency int
 	MinNumVotes         int
 	PollInterval        time.Duration
 	ForceRebuild        bool
-	SwapLockTimeout     string
+	SwapLockTimeout     time.Duration
 }

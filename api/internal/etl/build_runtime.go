@@ -37,7 +37,7 @@ func buildTitlesInBatches(ctx context.Context, pool *pgxpool.Pool, cfg Config, l
 	for {
 		tconsts, err := fetchTconstBatch(ctx, pool, last, cfg.BatchSize)
 		if err != nil {
-			return err
+			return fmt.Errorf("fetch title batch after %q: %w", last, err)
 		}
 		if len(tconsts) == 0 {
 			break
@@ -53,7 +53,7 @@ func buildTitlesInBatches(ctx context.Context, pool *pgxpool.Pool, cfg Config, l
 		err = buildAndInsertBatch(ctx, conn, cfg, tconsts, datasetDate, logger)
 		conn.Release()
 		if err != nil {
-			return err
+			return fmt.Errorf("build batch %d: %w", batchNum, err)
 		}
 
 		last = tconsts[len(tconsts)-1]
@@ -69,9 +69,9 @@ SELECT tconst
 FROM title_filter
 WHERE tconst > $1
 ORDER BY tconst
-LIMIT $2`, last, limit)
+	LIMIT $2`, last, limit)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("query title batch: %w", err)
 	}
 	defer rows.Close()
 
@@ -79,11 +79,14 @@ LIMIT $2`, last, limit)
 	for rows.Next() {
 		var tconst string
 		if err := rows.Scan(&tconst); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan title batch: %w", err)
 		}
 		out = append(out, tconst)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate title batch: %w", err)
+	}
+	return out, nil
 }
 
 func fetchBatchData(ctx context.Context, conn *pgxpool.Conn, cfg Config, tconsts []string) (batchFetchData, error) {
@@ -294,12 +297,12 @@ func copyBatchRows(
 func buildAndInsertBatch(ctx context.Context, conn *pgxpool.Conn, cfg Config, tconsts []string, datasetDate time.Time, logger *log.Logger) error {
 	data, err := fetchBatchData(ctx, conn, cfg, tconsts)
 	if err != nil {
-		return err
+		return fmt.Errorf("fetch batch data: %w", err)
 	}
 
 	tx, err := conn.Begin(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin batch transaction: %w", err)
 	}
 	defer func() {
 		_ = tx.Rollback(ctx)
@@ -307,7 +310,7 @@ func buildAndInsertBatch(ctx context.Context, conn *pgxpool.Conn, cfg Config, tc
 
 	copyResult, err := copyBatchRows(ctx, tx, cfg, tconsts, datasetDate, data)
 	if err != nil {
-		return err
+		return fmt.Errorf("copy batch rows: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
