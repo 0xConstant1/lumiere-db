@@ -41,6 +41,7 @@ ALTER INDEX IF EXISTS idx_titles_next_genres_gin RENAME TO idx_titles_genres_gin
 ALTER INDEX IF EXISTS idx_titles_next_type_votes RENAME TO idx_titles_type_votes;
 ALTER INDEX IF EXISTS idx_titles_next_tvseries_votes RENAME TO idx_titles_tv_votes;
 ALTER INDEX IF EXISTS idx_discover_core_next_group_votes_tconst RENAME TO idx_discover_core_group_votes_tconst;
+ALTER INDEX IF EXISTS idx_discover_core_next_genres_gin_build RENAME TO idx_discover_core_genres_gin;
 ALTER INDEX IF EXISTS idx_discover_core_next_group_rating_votes_tconst RENAME TO idx_discover_core_group_rating_votes_tconst;
 ALTER INDEX IF EXISTS idx_discover_core_next_group_newest_votes_tconst RENAME TO idx_discover_core_group_newest_votes_tconst;
 ALTER INDEX IF EXISTS idx_discover_core_next_group_oldest_votes_tconst RENAME TO idx_discover_core_group_oldest_votes_tconst;

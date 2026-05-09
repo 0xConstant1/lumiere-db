@@ -10,7 +10,7 @@ CREATE INDEX IF NOT EXISTS idx_titles_next_tvseries_votes
 CREATE INDEX IF NOT EXISTS idx_discover_core_next_group_votes_tconst
   ON discover_core_next (type_group, num_votes DESC NULLS LAST, tconst DESC);
 
-CREATE INDEX IF NOT EXISTS idx_discover_core_next_genres_gin
+CREATE INDEX IF NOT EXISTS idx_discover_core_next_genres_gin_build
   ON discover_core_next USING GIN (genres);
 
 CREATE INDEX IF NOT EXISTS idx_discover_core_next_group_rating_votes_tconst
