@@ -1,6 +1,6 @@
 services:
   db:
-    image: paradedb/paradedb:0.22.6
+    image: paradedb/paradedb:0.23.4
     container_name: lumiere_postgres
     restart: always
     shm_size: "4gb"
